@@ -112,10 +112,13 @@ jobs:
 
       # Apple targets need only `rustup target add`, which
       # upload-rust-binary-action performs itself, so skip them here.
+      # Android targets are pinned to API 24: portable-pty calls openpty,
+      # which only exists in Android's libc since API 23, and the default
+      # NDK link uses API 21 (undefined symbol `openpty` at link time).
       - name: Install cross-compilation toolchain
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
-          target: ${{ matrix.target }}
+          target: ${{ matrix.target }}${{ contains(matrix.target, 'linux-android') && '@24' || '' }}
           runner: none
         if: ${{ !contains(matrix.target, '-apple-') }}
 
