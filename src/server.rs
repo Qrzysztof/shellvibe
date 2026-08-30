@@ -1,0 +1,818 @@
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, bail};
+use rmcp::{
+    ErrorData, RoleServer, ServerHandler,
+    model::{
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+        ClientCapabilities, CreateTaskResult, GetTaskParams, GetTaskResult, Implementation,
+        ListToolsResult, ProgressNotificationParam, ProgressToken, ProtocolVersion,
+        RequestParamsMeta, ServerCapabilities, ServerInfo, Tool, UpdateTaskParams,
+    },
+    service::RequestContext,
+    task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions},
+};
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value, json};
+use tracing::debug;
+
+const MAX_TOOL_ERROR_CHARS: usize = 2_048;
+const MAX_TOOL_NAME_CHARS: usize = 128;
+
+use crate::{
+    config::{Config, duration_ms},
+    model::{
+        CommandMode, CommandSpec, ExecutionMode, MAX_ARG_BYTES, MAX_ARGV_BYTES, MAX_ARGV_ITEMS,
+        MAX_COMMAND_BYTES, MAX_ENV_BYTES, MAX_ENV_ITEMS, MAX_PATH_BYTES, MAX_STDIN_BYTES,
+        ProcessSnapshot, ProcessStatus, ReadRequest, ResizeRequest, ShellRequest, SignalRequest,
+        WriteRequest,
+    },
+    process::{ManagedProcess, ProcessManager, sanitize_output},
+    schema,
+};
+
+#[derive(Clone)]
+pub struct ShellVibe {
+    config: Arc<Config>,
+    manager: ProcessManager,
+    tasks: TaskManager,
+    tool_limiter: Arc<SlidingWindowLimiter>,
+}
+
+#[derive(Debug)]
+struct SlidingWindowLimiter {
+    limit: usize,
+    window: Duration,
+    hits: StdMutex<VecDeque<Instant>>,
+}
+
+impl SlidingWindowLimiter {
+    fn per_minute(limit: usize) -> Self {
+        Self {
+            limit,
+            window: Duration::from_secs(60),
+            hits: StdMutex::new(VecDeque::with_capacity(limit.min(4096))),
+        }
+    }
+
+    fn check(&self) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let mut hits = self.hits.lock().expect("tool rate-limit mutex poisoned");
+        while hits
+            .front()
+            .is_some_and(|timestamp| now.duration_since(*timestamp) >= self.window)
+        {
+            hits.pop_front();
+        }
+        if hits.len() >= self.limit {
+            bail!("tool invocation rate limit exceeded; retry later");
+        }
+        hits.push_back(now);
+        Ok(())
+    }
+}
+
+fn validate_shell_request(request: &ShellRequest) -> anyhow::Result<()> {
+    if let Some(command) = &request.command {
+        if command.len() > MAX_COMMAND_BYTES {
+            bail!("command exceeds the maximum size of {MAX_COMMAND_BYTES} bytes");
+        }
+        if command.contains('\0') {
+            bail!("command must not contain NUL bytes");
+        }
+    }
+
+    if let Some(argv) = &request.argv {
+        if argv.len() > MAX_ARGV_ITEMS {
+            bail!("argv contains too many items (maximum {MAX_ARGV_ITEMS})");
+        }
+        let mut total = 0usize;
+        for argument in argv {
+            if argument.len() > MAX_ARG_BYTES {
+                bail!("an argv item exceeds the maximum size of {MAX_ARG_BYTES} bytes");
+            }
+            if argument.contains('\0') {
+                bail!("argv items must not contain NUL bytes");
+            }
+            total = total.saturating_add(argument.len());
+        }
+        if total > MAX_ARGV_BYTES {
+            bail!("argv exceeds the maximum aggregate size of {MAX_ARGV_BYTES} bytes");
+        }
+    }
+
+    if request.env.len() > MAX_ENV_ITEMS {
+        bail!("env contains too many variables (maximum {MAX_ENV_ITEMS})");
+    }
+    let mut env_bytes = 0usize;
+    for (key, value) in &request.env {
+        if key.is_empty() || key.contains('\0') || key.contains('=') {
+            bail!("environment variable names must be non-empty and contain neither NUL nor '='");
+        }
+        if value.contains('\0') {
+            bail!("environment variable values must not contain NUL bytes");
+        }
+        env_bytes = env_bytes
+            .saturating_add(key.len())
+            .saturating_add(value.len());
+    }
+    if env_bytes > MAX_ENV_BYTES {
+        bail!("env exceeds the maximum aggregate size of {MAX_ENV_BYTES} bytes");
+    }
+
+    if let Some(cwd) = &request.cwd {
+        let cwd = cwd.to_string_lossy();
+        if cwd.len() > MAX_PATH_BYTES {
+            bail!("cwd exceeds the maximum size of {MAX_PATH_BYTES} bytes");
+        }
+        if cwd.contains('\0') {
+            bail!("cwd must not contain NUL bytes");
+        }
+    }
+
+    if request
+        .stdin
+        .as_ref()
+        .is_some_and(|stdin| stdin.len() > MAX_STDIN_BYTES)
+    {
+        bail!("stdin exceeds the maximum size of {MAX_STDIN_BYTES} bytes");
+    }
+    Ok(())
+}
+
+impl ShellVibe {
+    pub fn new(config: Config) -> Self {
+        let config = Arc::new(config);
+        let manager = ProcessManager::new(Arc::clone(&config));
+        let tool_limiter = Arc::new(SlidingWindowLimiter::per_minute(
+            config.max_tool_calls_per_minute,
+        ));
+        Self {
+            config,
+            manager,
+            tasks: TaskManager::new(),
+            tool_limiter,
+        }
+    }
+
+    pub fn policy_name(&self) -> &'static str {
+        self.config.policy.name()
+    }
+
+    pub async fn shutdown(&self) {
+        // ProcessManager owns OS process lifetime. Stop processes first so task
+        // futures can observe terminal state, then clear the protocol task store.
+        if let Err(error) = self.manager.shutdown().await {
+            tracing::error!(%error, "failed to stop managed processes during shutdown");
+        }
+        self.tasks.shutdown();
+    }
+
+    fn build_spec(&self, request: ShellRequest) -> anyhow::Result<(CommandSpec, Duration)> {
+        validate_shell_request(&request)?;
+        let cwd = request.cwd.unwrap_or_else(|| self.config.workdir.clone());
+        if !cwd.is_dir() {
+            bail!(
+                "cwd does not exist or is not a directory: {}",
+                cwd.display()
+            );
+        }
+        let cwd = std::fs::canonicalize(&cwd)
+            .with_context(|| format!("failed to canonicalize cwd {}", cwd.display()))?;
+
+        let mode = if self.config.policy.is_restricted() {
+            if request.command.is_some() {
+                bail!("this shellvibe instance is restricted; use argv, not command");
+            }
+            let argv = request
+                .argv
+                .context("argv is required in restricted mode")?;
+            if argv.is_empty() {
+                bail!("argv must contain at least argv[0]");
+            }
+            let executable = self.config.policy.authorize(&argv[0], &cwd)?;
+            CommandMode::Direct { argv, executable }
+        } else {
+            if request.argv.is_some() {
+                bail!("this shellvibe instance is unrestricted; use command, not argv");
+            }
+            let command = request.command.context("command is required")?;
+            if command.trim().is_empty() {
+                bail!("command must not be empty");
+            }
+            CommandMode::Shell {
+                shell: self.config.shell.clone(),
+                command,
+            }
+        };
+
+        let timeout = match request.timeout_ms {
+            Some(0) => bail!("timeoutMs must be greater than zero"),
+            Some(milliseconds) => Duration::from_millis(milliseconds).min(self.config.max_runtime),
+            None => self.config.max_runtime,
+        };
+
+        let yield_after = request
+            .yield_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.config.yield_after);
+        if yield_after.is_zero() {
+            bail!("yieldMs must be greater than zero");
+        }
+
+        let execution = request.execution;
+        let pty = request.pty || execution == ExecutionMode::Interactive;
+        let rows = request.rows.unwrap_or(24);
+        let cols = request.cols.unwrap_or(80);
+        if rows == 0 || cols == 0 {
+            bail!("PTY rows and cols must be greater than zero");
+        }
+        if rows > 1000 || cols > 2000 {
+            bail!("PTY rows/cols exceed the supported maximum of 1000x2000");
+        }
+
+        Ok((
+            CommandSpec {
+                mode,
+                execution,
+                cwd,
+                env: request.env,
+                initial_stdin: request.stdin,
+                pty,
+                rows,
+                cols,
+                timeout,
+            },
+            yield_after,
+        ))
+    }
+
+    async fn call_shell(
+        &self,
+        request: ShellRequest,
+        progress_token: Option<ProgressToken>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResponse {
+        match self
+            .call_shell_inner(request, progress_token, context)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => CallToolResponse::Complete(tool_error(error)),
+        }
+    }
+
+    async fn call_shell_inner(
+        &self,
+        request: ShellRequest,
+        progress_token: Option<ProgressToken>,
+        context: RequestContext<RoleServer>,
+    ) -> anyhow::Result<CallToolResponse> {
+        let (spec, yield_after) = self.build_spec(request)?;
+        let execution = spec.execution;
+        let process = self.manager.spawn(spec).await?;
+
+        match execution {
+            ExecutionMode::Background => Ok(CallToolResponse::Complete(success_result(
+                process.snapshot(0),
+            ))),
+            ExecutionMode::Interactive => {
+                // Give fast-starting REPLs a tiny opportunity to expose their prompt
+                // without delaying the background-style lifecycle.
+                process
+                    .wait_for_change(0, yield_after.min(Duration::from_millis(150)))
+                    .await;
+                Ok(CallToolResponse::Complete(success_result(
+                    process.snapshot(0),
+                )))
+            }
+            ExecutionMode::Foreground => {
+                self.run_foreground(process, yield_after, progress_token, context)
+                    .await
+            }
+        }
+    }
+
+    async fn run_foreground(
+        &self,
+        process: Arc<ManagedProcess>,
+        yield_after: Duration,
+        progress_token: Option<ProgressToken>,
+        context: RequestContext<RoleServer>,
+    ) -> anyhow::Result<CallToolResponse> {
+        // Tasks are a 2026-07-28 extension and are only legal when the client
+        // negotiated that protocol revision and explicitly declared the extension.
+        let supports_tasks = context
+            .protocol_version()
+            .as_ref()
+            .is_some_and(|version| version == &ProtocolVersion::V_2026_07_28)
+            && context
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.supports_tasks());
+
+        let deadline = tokio::time::sleep(yield_after);
+        tokio::pin!(deadline);
+        let mut interval = tokio::time::interval(self.config.progress_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume tokio::interval's immediate first tick; progress should describe
+        // actual elapsed work, not fire at t=0.
+        interval.tick().await;
+        let mut progress_counter = 0_f64;
+
+        loop {
+            if !process.is_running() {
+                return Ok(CallToolResponse::Complete(result_for_snapshot(
+                    process.snapshot(0),
+                )));
+            }
+
+            tokio::select! {
+                () = context.ct.cancelled() => {
+                    process
+                        .terminate(
+                            ProcessStatus::Cancelled,
+                            "REQUEST_CANCELLED",
+                            self.config.termination_grace,
+                        )
+                        .await?;
+                    return Ok(CallToolResponse::Complete(result_for_snapshot(process.snapshot(0))));
+                }
+                _ = &mut deadline => {
+                    if !process.is_running() {
+                        return Ok(CallToolResponse::Complete(result_for_snapshot(process.snapshot(0))));
+                    }
+                    if supports_tasks {
+                        return Ok(self.create_process_task(process));
+                    }
+                    return Ok(CallToolResponse::Complete(success_result(process.snapshot(0))));
+                }
+                _ = process.wait_for_notification() => {
+                    if !process.is_running() {
+                        return Ok(CallToolResponse::Complete(result_for_snapshot(process.snapshot(0))));
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Some(token) = progress_token.clone() {
+                        progress_counter += 1.0;
+                        let notification = ProgressNotificationParam::new(token, progress_counter)
+                            .with_message(process.progress_message());
+                        if let Err(error) = context.peer.notify_progress(notification).await {
+                            debug!(%error, "client rejected progress notification");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn create_process_task(&self, process: Arc<ManagedProcess>) -> CallToolResponse {
+        let initial_message = process.progress_message();
+        let poll_ms = duration_ms(self.config.task_poll_interval).max(1);
+        let ttl_ms = duration_ms(self.config.task_ttl).max(1);
+        let status_interval = self.config.progress_interval;
+        let termination_grace = self.config.termination_grace;
+        let max_task_result_output = self.config.max_task_result_output;
+
+        let task = self.tasks.spawn(
+            TaskOptions::new()
+                .with_ttl_ms(Some(ttl_ms))
+                .with_poll_interval_ms(poll_ms)
+                .with_status_message(initial_message),
+            move |task_context| {
+                Box::pin(run_process_task(
+                    process,
+                    task_context,
+                    status_interval,
+                    termination_grace,
+                    max_task_result_output,
+                ))
+            },
+        );
+
+        CallToolResponse::Task(CreateTaskResult::new(task))
+    }
+
+    async fn call_read(&self, request: ReadRequest) -> CallToolResult {
+        let result = async {
+            let process = self.manager.get(&request.process_id)?;
+            let wait =
+                Duration::from_millis(request.wait_ms.unwrap_or(0)).min(self.config.max_read_wait);
+            if !wait.is_zero() {
+                process.wait_for_change(request.cursor, wait).await;
+            }
+            Ok::<_, anyhow::Error>(process.snapshot(request.cursor))
+        }
+        .await;
+        match result {
+            Ok(snapshot) => success_result(snapshot),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    async fn call_write(&self, request: WriteRequest) -> CallToolResult {
+        let result = async {
+            if request.data.is_none() && !request.close_stdin {
+                bail!("shell_write requires data and/or closeStdin=true");
+            }
+            let process = self.manager.get(&request.process_id)?;
+            if request.data.as_ref().is_some_and(|data| {
+                data.len()
+                    .saturating_add(if request.append_newline { 1 } else { 0 })
+                    > MAX_STDIN_BYTES
+            }) {
+                bail!("shell_write data exceeds the maximum size of {MAX_STDIN_BYTES} bytes");
+            }
+            if let Some(mut data) = request.data {
+                if request.append_newline {
+                    data.push('\n');
+                }
+                process.write(data.as_bytes()).await?;
+            }
+            if request.close_stdin {
+                process.close_stdin().await;
+            }
+            Ok::<_, anyhow::Error>(process.snapshot(0))
+        }
+        .await;
+        match result {
+            Ok(snapshot) => success_result(snapshot),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    async fn call_signal(&self, request: SignalRequest) -> CallToolResult {
+        let result = async {
+            let process = self.manager.get(&request.process_id)?;
+            process.signal(request.signal).await?;
+            if process.is_running() {
+                let cursor = process.snapshot(0).next_cursor;
+                process
+                    .wait_for_change(cursor, Duration::from_millis(75))
+                    .await;
+            }
+            Ok::<_, anyhow::Error>(process.snapshot(0))
+        }
+        .await;
+        match result {
+            Ok(snapshot) => success_result(snapshot),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    async fn call_resize(&self, request: ResizeRequest) -> CallToolResult {
+        let result = async {
+            let process = self.manager.get(&request.process_id)?;
+            process.resize(request.rows, request.cols).await?;
+            Ok::<_, anyhow::Error>(process.snapshot(0))
+        }
+        .await;
+        match result {
+            Ok(snapshot) => success_result(snapshot),
+            Err(error) => tool_error(error),
+        }
+    }
+}
+
+struct TaskProcessGuard {
+    process: Arc<ManagedProcess>,
+    termination_grace: Duration,
+    armed: bool,
+}
+
+impl TaskProcessGuard {
+    fn new(process: Arc<ManagedProcess>, termination_grace: Duration) -> Self {
+        Self {
+            process,
+            termination_grace,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TaskProcessGuard {
+    fn drop(&mut self) {
+        if !self.armed || !self.process.is_running() {
+            return;
+        }
+        let process = Arc::clone(&self.process);
+        let grace = self.termination_grace;
+        // TaskManager may abort a task future when its TTL expires. The OS process
+        // must never outlive that abandoned protocol lifecycle invisibly.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = process
+                    .terminate(ProcessStatus::Cancelled, "TASK_ABORTED", grace)
+                    .await;
+            });
+        }
+    }
+}
+
+async fn run_process_task(
+    process: Arc<ManagedProcess>,
+    task_context: TaskContext,
+    status_interval: Duration,
+    termination_grace: Duration,
+    max_task_result_output: usize,
+) -> Result<CallToolResult, TaskExit> {
+    let mut guard = TaskProcessGuard::new(Arc::clone(&process), termination_grace);
+    let mut interval = tokio::time::interval(status_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+
+    loop {
+        if !process.is_running() {
+            guard.disarm();
+            return Ok(result_for_snapshot(
+                process.snapshot_with_limit(0, max_task_result_output),
+            ));
+        }
+
+        tokio::select! {
+            () = task_context.cancelled() => {
+                if let Err(error) = process
+                    .terminate(ProcessStatus::Cancelled, "TASK_CANCELLED", termination_grace)
+                    .await
+                {
+                    return Err(TaskExit::Error(ErrorData::internal_error(
+                        format!("failed to terminate cancelled process: {error}"),
+                        None,
+                    )));
+                }
+                let snapshot = process.snapshot_with_limit(0, max_task_result_output);
+                if snapshot.status == ProcessStatus::Cancelled {
+                    return Err(TaskExit::Cancelled);
+                }
+                // A timeout or another terminal condition may have won the race
+                // with cancellation. Preserve that real terminal outcome instead
+                // of masking it as a cancelled Task.
+                guard.disarm();
+                return Ok(result_for_snapshot(snapshot));
+            }
+            _ = process.wait_for_notification() => {
+                if !process.is_running() {
+                    return Ok(result_for_snapshot(process.snapshot_with_limit(
+                        0,
+                        max_task_result_output,
+                    )));
+                }
+            }
+            _ = interval.tick() => {
+                task_context.set_status_message(process.progress_message());
+            }
+        }
+    }
+}
+
+impl ServerHandler for ShellVibe {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Owned(vec![ProtocolVersion::V_2026_07_28])
+    }
+
+    fn get_info(&self) -> ServerInfo {
+        let instructions = if self.config.policy.is_restricted() {
+            format!(
+                "shellvibe provides direct process execution under the '{}' executable policy. Use shell with argv; shell syntax is intentionally unavailable. foreground commands may transparently use MCP Tasks when the client supports io.modelcontextprotocol/tasks. Use background/interactive plus shell_read/shell_write/shell_signal/shell_resize for explicit process control. Executable policy is a top-level guardrail, not an OS sandbox. Task IDs remain available only for the lifetime of this shellvibe server process.",
+                self.config.policy.name()
+            )
+        } else {
+            "shellvibe provides unrestricted local shell access with the permissions of the user running this MCP server. Commands can be destructive and may access files, processes, and the network. foreground commands may transparently use MCP Tasks when supported; background/interactive return explicit process handles. Task IDs remain available only for the lifetime of this shellvibe server process."
+                .to_string()
+        };
+
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build(),
+        )
+        .with_protocol_version(ProtocolVersion::V_2026_07_28)
+        .with_server_info(
+            Implementation::new("shellvibe", env!("CARGO_PKG_VERSION"))
+                .with_title("shellvibe")
+                .with_description("Observable shell and process lifecycle access for MCP agents"),
+        )
+        .with_instructions(instructions)
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        schema::get_tool(&self.config.policy, name)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(
+            ListToolsResult::with_all_items(schema::tools(&self.config.policy))
+                .with_ttl_ms(60_000)
+                .with_cache_scope(CacheScope::Private),
+        )
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let progress_token = request.progress_token();
+        let name = request.name.to_string();
+        let arguments = request.arguments.unwrap_or_default();
+
+        if schema::get_tool(&self.config.policy, &name).is_none() {
+            let safe_name = bounded_text(&sanitize_output(&name), MAX_TOOL_NAME_CHARS);
+            return Err(ErrorData::invalid_params(
+                format!("unknown tool '{safe_name}'"),
+                None,
+            ));
+        }
+
+        if let Err(error) = self.tool_limiter.check() {
+            return Ok(CallToolResponse::Complete(tool_error(error)));
+        }
+
+        let response = match name.as_str() {
+            "shell" => {
+                let args = match decode::<ShellRequest>(arguments) {
+                    Ok(args) => args,
+                    Err(error) => return Ok(CallToolResponse::Complete(tool_error(error))),
+                };
+                self.call_shell(args, progress_token, context).await
+            }
+            "shell_read" => {
+                let args = match decode::<ReadRequest>(arguments) {
+                    Ok(args) => args,
+                    Err(error) => return Ok(CallToolResponse::Complete(tool_error(error))),
+                };
+                tokio::select! {
+                    result = self.call_read(args) => CallToolResponse::Complete(result),
+                    () = context.ct.cancelled() => CallToolResponse::Complete(request_cancelled()),
+                }
+            }
+            "shell_write" => {
+                let args = match decode::<WriteRequest>(arguments) {
+                    Ok(args) => args,
+                    Err(error) => return Ok(CallToolResponse::Complete(tool_error(error))),
+                };
+                tokio::select! {
+                    result = self.call_write(args) => CallToolResponse::Complete(result),
+                    () = context.ct.cancelled() => CallToolResponse::Complete(request_cancelled()),
+                }
+            }
+            "shell_signal" => {
+                let args = match decode::<SignalRequest>(arguments) {
+                    Ok(args) => args,
+                    Err(error) => return Ok(CallToolResponse::Complete(tool_error(error))),
+                };
+                tokio::select! {
+                    result = self.call_signal(args) => CallToolResponse::Complete(result),
+                    () = context.ct.cancelled() => CallToolResponse::Complete(request_cancelled()),
+                }
+            }
+            "shell_resize" => {
+                let args = match decode::<ResizeRequest>(arguments) {
+                    Ok(args) => args,
+                    Err(error) => return Ok(CallToolResponse::Complete(tool_error(error))),
+                };
+                tokio::select! {
+                    result = self.call_resize(args) => CallToolResponse::Complete(result),
+                    () = context.ct.cancelled() => CallToolResponse::Complete(request_cancelled()),
+                }
+            }
+            _ => unreachable!("tool existence was checked before dispatch"),
+        };
+        Ok(response)
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        require_tasks(&context)?;
+        self.tasks
+            .get_task(&request.task_id)
+            .map(GetTaskResult::new)
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        require_tasks(&context)?;
+        self.tasks
+            .update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        require_tasks(&context)?;
+        self.tasks.cancel_task(&request.task_id)
+    }
+}
+
+fn require_tasks(context: &RequestContext<RoleServer>) -> Result<(), ErrorData> {
+    let supported = context
+        .protocol_version()
+        .as_ref()
+        .is_some_and(|version| version == &ProtocolVersion::V_2026_07_28)
+        && context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.supports_tasks());
+    if supported {
+        Ok(())
+    } else {
+        Err(ErrorData::missing_required_client_capability(
+            ClientCapabilities::builder().enable_tasks().build(),
+        ))
+    }
+}
+
+fn decode<T: DeserializeOwned>(arguments: Map<String, Value>) -> anyhow::Result<T> {
+    serde_json::from_value(Value::Object(arguments)).context("invalid tool arguments")
+}
+
+fn result_for_snapshot(snapshot: ProcessSnapshot) -> CallToolResult {
+    let is_failure = snapshot.status.is_terminal()
+        && !(snapshot.status == ProcessStatus::Exited && snapshot.exit_code == Some(0));
+    if is_failure {
+        snapshot_result(snapshot, true)
+    } else {
+        snapshot_result(snapshot, false)
+    }
+}
+
+fn success_result(snapshot: ProcessSnapshot) -> CallToolResult {
+    snapshot_result(snapshot, false)
+}
+
+fn snapshot_result(snapshot: ProcessSnapshot, is_error: bool) -> CallToolResult {
+    let structured =
+        serde_json::to_value(&snapshot).expect("ProcessSnapshot serialization is infallible");
+    if is_error {
+        CallToolResult::structured_error(structured)
+    } else {
+        CallToolResult::structured(structured)
+    }
+}
+
+fn tool_error(error: anyhow::Error) -> CallToolResult {
+    let message = bounded_text(&sanitize_output(&error.to_string()), MAX_TOOL_ERROR_CHARS);
+    CallToolResult::structured_error(json!({
+        "error": "shellvibe_error",
+        "message": message,
+    }))
+}
+
+fn request_cancelled() -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": "shellvibe_error",
+        "message": "request cancelled",
+    }))
+}
+
+fn bounded_text(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars();
+    let mut output: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        output.push('…');
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_errors_have_structured_output() {
+        let result = tool_error(anyhow::anyhow!("boom"));
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"error": "shellvibe_error", "message": "boom"}))
+        );
+    }
+
+    #[test]
+    fn tool_rate_limiter_is_bounded() {
+        let limiter = SlidingWindowLimiter::per_minute(2);
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_err());
+    }
+}

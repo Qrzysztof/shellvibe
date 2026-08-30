@@ -1,0 +1,168 @@
+name: Release
+
+# Publishes prebuilt binaries to GitHub Releases whenever a `v*` tag is
+# pushed (the same trigger used by publish.yml for crates.io). Every matrix
+# cell builds one binary (target x Rust toolchain) and uploads it as a
+# compressed archive plus a SHA-256 checksum, so users without Rust or Cargo
+# can download a binary and drop it straight into their `bin` folder.
+#
+# Uses the taiki-e release stack:
+#   - create-gh-release-action     creates the GitHub Release for the tag
+#   - setup-cross-toolchain-action installs NDK/GCC cross linkers where the
+#     target cannot be built with the runner's native toolchain
+#   - upload-rust-binary-action    builds (with rustup target add) and uploads
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          allow-missing-changelog: true # repo has no CHANGELOG.md; use generated notes
+
+  upload-assets:
+    name: Upload ${{ matrix.target }} (rust ${{ matrix.toolchain }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Build each target with the MSRV (1.98.0, matching rust-version in
+        # Cargo.toml) and with latest stable, so users can pick the
+        # compatibility level. RUSTUP_TOOLCHAIN (set below) pins the
+        # toolchain for the job.
+        # `target` and `toolchain` are matrix dimensions (13 x 2 = 26 jobs);
+        # the `include` entries merge the runner OS into each target combo.
+        target:
+          # Linux (glibc and fully static musl builds)
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          # macOS
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          # iOS. Note: the binary is an unsigned Mach-O. iOS has no
+          # user-installable `bin` folder, so it cannot be run on a device
+          # as-is; this artifact is for signing/embedding into an app.
+          - aarch64-apple-ios
+          # Windows (static CRT, no VC++ runtime needed on the target)
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+          # Android (NDK; usable e.g. under Termux)
+          - aarch64-linux-android
+          - x86_64-linux-android
+          - armv7-linux-androideabi
+        toolchain: [1.98.0, stable]
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-22.04
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: aarch64-apple-ios
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+          - target: aarch64-pc-windows-msvc
+            os: windows-2022
+          - target: aarch64-linux-android
+            os: ubuntu-22.04
+          - target: x86_64-linux-android
+            os: ubuntu-22.04
+          - target: armv7-linux-androideabi
+            os: ubuntu-22.04
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      # Apple targets need only `rustup target add`, which
+      # upload-rust-binary-action performs itself, so skip them here.
+      - name: Install cross-compilation toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+          runner: none
+        if: ${{ !contains(matrix.target, '-apple-') }}
+
+      - name: Link Windows binaries against the static CRT
+        run: printf 'RUSTFLAGS=%s\n' "${RUSTFLAGS} -C target-feature=+crt-static" >>"${GITHUB_ENV}"
+        shell: bash
+        if: contains(matrix.target, '-windows-msvc')
+
+      - name: Build fully static Linux binaries
+        run: printf 'RUSTFLAGS=%s\n' "${RUSTFLAGS} -C target-feature=+crt-static -C link-self-contained=yes" >>"${GITHUB_ENV}"
+        shell: bash
+        if: contains(matrix.target, '-linux-musl')
+
+      - name: Support older Apple OS versions
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-apple-darwin) echo "MACOSX_DEPLOYMENT_TARGET=10.12" >>"${GITHUB_ENV}" ;;
+            aarch64-apple-darwin) echo "MACOSX_DEPLOYMENT_TARGET=11.0" >>"${GITHUB_ENV}" ;;
+            # rustc defaults the iOS link to min 10.0 while aws-lc-sys
+            # compiles against the SDK's default, so the C objects call
+            # ___chkstk_darwin which the 10.0 link cannot resolve; pinning
+            # IPHONEOS_DEPLOYMENT_TARGET makes both sides agree.
+            aarch64-apple-ios) echo "IPHONEOS_DEPLOYMENT_TARGET=18.5" >>"${GITHUB_ENV}" ;;
+          esac
+        shell: bash
+
+      # Archive names embed a stable label (`-rust-msrv` / `-rust-stable`)
+      # instead of the exact rustc version, so the
+      # `/releases/latest/download/<name>` URLs in the README and docs stay
+      # valid across releases and Rust updates.
+      - name: Record Rust build label for artifact names
+        run: |
+          case "${{ matrix.toolchain }}" in
+            1.98.0) echo "RUSTC_LABEL=rust-msrv" >>"${GITHUB_ENV}" ;;
+            *) echo "RUSTC_LABEL=rust-stable" >>"${GITHUB_ENV}" ;;
+          esac
+        shell: bash
+
+      - name: Build and upload binary to GitHub Releases
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: shellvibe
+          target: ${{ matrix.target }}
+          archive: $bin-$target-${{ env.RUSTC_LABEL }}
+          locked: true
+          tar: unix
+          zip: windows
+          checksum: sha256
+          include: LICENSE
+          asset: install.sh
