@@ -61,8 +61,8 @@ pub struct Cli {
     #[arg(long = "max-output", default_value = "4MiB", value_parser = parse_bytes)]
     pub max_output: usize,
 
-    /// Maximum retained event-data budget returned by one MCP tool result.
-    #[arg(long = "max-response-output", default_value = "256KiB", value_parser = parse_bytes)]
+    /// Maximum event-data budget for shell_read pages and other output-bearing results.
+    #[arg(long = "max-response-output", default_value = "32KiB", value_parser = parse_bytes)]
     pub max_response_output: usize,
 
     /// Maximum event-data budget persisted in a completed MCP Task result.

@@ -10,6 +10,7 @@ pub const MAX_ENV_ITEMS: usize = 4096;
 pub const MAX_ENV_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_STDIN_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PATH_BYTES: usize = 64 * 1024;
+pub const MIN_READ_PAGE_BYTES: usize = 8 * 1024;
 
 const MAX_DISPLAY_NAME_CHARS: usize = 160;
 
@@ -60,6 +61,8 @@ pub struct ReadRequest {
     pub cursor: u64,
     #[serde(default)]
     pub wait_ms: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

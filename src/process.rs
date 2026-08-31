@@ -608,14 +608,23 @@ impl ManagedProcess {
     }
 
     pub async fn wait_for_change(&self, cursor: u64, max_wait: Duration) {
-        if self.has_change_since(cursor) || !self.is_running() {
-            return;
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            // Register before checking observable state so a change cannot land
+            // between the check and waiter registration.
+            let notified = self.notify.notified();
+            if self.has_change_since(cursor) || !self.is_running() {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return;
+            }
         }
-        let notified = self.notify.notified();
-        if self.has_change_since(cursor) || !self.is_running() {
-            return;
-        }
-        let _ = tokio::time::timeout(max_wait, notified).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_for_test(&self) {
+        self.notify.notify_waiters();
     }
 
     fn has_change_since(&self, cursor: u64) -> bool {
@@ -666,7 +675,11 @@ impl ManagedProcess {
         }
     }
 
-    pub fn read_result(&self, cursor: u64) -> anyhow::Result<ProcessReadResult> {
+    pub fn read_result(
+        &self,
+        cursor: u64,
+        max_output_bytes: usize,
+    ) -> anyhow::Result<ProcessReadResult> {
         let state = self.state.lock().expect("state mutex poisoned").clone();
         let output = self.output.lock().expect("output mutex poisoned");
         let newest_cursor = output.newest_cursor();
@@ -674,7 +687,7 @@ impl ManagedProcess {
             bail!("cursor {cursor} is ahead of the newest cursor {newest_cursor}");
         }
         let (events, next_cursor, cursor_lost, has_more) =
-            output.read_since(cursor, self.max_response_output);
+            output.read_since(cursor, max_output_bytes.min(self.max_response_output));
         let terminal = state.status.is_terminal();
         Ok(ProcessReadResult {
             process_id: self.id.clone(),

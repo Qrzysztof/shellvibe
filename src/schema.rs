@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::{
     model::{
         MAX_ARG_BYTES, MAX_ARGV_ITEMS, MAX_COMMAND_BYTES, MAX_ENV_ITEMS, MAX_PATH_BYTES,
-        MAX_STDIN_BYTES,
+        MAX_STDIN_BYTES, MIN_READ_PAGE_BYTES,
     },
     policy::ExecPolicy,
 };
@@ -119,7 +119,7 @@ fn common_shell_properties() -> JsonObject {
 fn read_tool() -> Tool {
     Tool::new(
         "shell_read",
-        "Canonical output retrieval for a managed process. Returns only events after the monotonic cursor and may wait up to waitMs for output or a state change. nextCursor is the cursor for the next read; hasMore means another immediate read is useful.",
+        "Canonical paginated output retrieval for a managed process. Returns retained output events after cursor. waitMs is only the maximum long-poll duration: a read returns on new output, terminal process state, or timeout. nextCursor is an output-event cursor for the next read, not a byte or line offset. hasMore=false means no additional buffered page is currently available; it does not imply that the process exited. cursorLost=true means output history requested by cursor was evicted.",
         arc_object(json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -127,8 +127,9 @@ fn read_tool() -> Tool {
             "required": ["processId"],
             "properties": {
                 "processId": {"type": "string", "pattern": "^p_[0-9a-f]{32}$"},
-                "cursor": {"type": "integer", "minimum": 0, "default": 0},
-                "waitMs": {"type": "integer", "minimum": 0, "default": 0}
+                "cursor": {"type": "integer", "minimum": 0, "default": 0, "description": "Output-event cursor returned as nextCursor by the previous read; not a byte or line offset."},
+                "waitMs": {"type": "integer", "minimum": 0, "default": 0, "description": "Maximum long-poll duration only. The read returns earlier for new output or terminal process state; the server caps this value."},
+                "maxBytes": {"type": "integer", "minimum": MIN_READ_PAGE_BYTES, "description": "Maximum output event-data bytes requested for this page. The server caps this value at its configured response maximum."}
             }
         })),
     )
@@ -260,10 +261,10 @@ fn shell_result_schema() -> Value {
             "cols": {"type": "integer", "minimum": 1},
             "exitCode": {"type": "integer"},
             "signal": {"type": "string"},
-            "elapsedMs": {"type": "integer", "minimum": 0},
+            "elapsedMs": {"type": "integer", "minimum": 0, "description": "Total process lifetime in milliseconds, not tool-call or read latency."},
             "output": {"type": "string", "description": "Bounded ordered output tail present for completed foreground execution."},
-            "outputTruncated": {"type": "boolean"},
-            "nextCursor": {"type": "integer", "minimum": 0}
+            "outputTruncated": {"type": "boolean", "description": "Whether foreground output was truncated. When true, retained output can be retrieved with shell_read(cursor=0) while the process handle remains available."},
+            "nextCursor": {"type": "integer", "minimum": 0, "description": "Latest output-event cursor, not a byte or line offset."}
         }
     })
 }
@@ -289,12 +290,12 @@ fn read_result_schema() -> Value {
                     }
                 }
             },
-            "nextCursor": {"type": "integer", "minimum": 0},
-            "hasMore": {"type": "boolean"},
-            "cursorLost": {"type": "boolean"},
+            "nextCursor": {"type": "integer", "minimum": 0, "description": "Output-event cursor to pass to the next read; not a byte or line offset."},
+            "hasMore": {"type": "boolean", "description": "Whether another buffered page is immediately available. false does not imply that the process exited."},
+            "cursorLost": {"type": "boolean", "description": "true when output history requested by cursor was evicted from retention."},
             "exitCode": {"type": "integer"},
             "signal": {"type": "string"},
-            "elapsedMs": {"type": "integer", "minimum": 0}
+            "elapsedMs": {"type": "integer", "minimum": 0, "description": "Total process lifetime in milliseconds, not shell_read latency."}
         }
     })
 }
@@ -382,5 +383,41 @@ mod tests {
             .unwrap();
         assert!(properties.contains_key("argv"));
         assert!(!properties.contains_key("command"));
+    }
+
+    #[test]
+    fn read_schema_exposes_bounded_page_controls_and_cursor_semantics() {
+        let tool = read_tool();
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            properties["maxBytes"]["minimum"],
+            json!(MIN_READ_PAGE_BYTES)
+        );
+        assert!(
+            properties["waitMs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Maximum long-poll duration only")
+        );
+
+        let output = tool.output_schema.unwrap();
+        let success = &output["oneOf"][0];
+        assert!(
+            success["properties"]["hasMore"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("does not imply")
+        );
+        assert!(
+            success["properties"]["cursorLost"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("evicted")
+        );
     }
 }

@@ -30,8 +30,8 @@ use crate::{
     model::{
         CommandMode, CommandSpec, ExecutionMode, MAX_ARG_BYTES, MAX_ARGV_BYTES, MAX_ARGV_ITEMS,
         MAX_COMMAND_BYTES, MAX_ENV_BYTES, MAX_ENV_ITEMS, MAX_PATH_BYTES, MAX_STDIN_BYTES,
-        ProcessStatus, ReadRequest, ResizeRequest, ShellRequest, ShellResult, SignalRequest,
-        WriteRequest,
+        MIN_READ_PAGE_BYTES, ProcessStatus, ReadRequest, ResizeRequest, ShellRequest, ShellResult,
+        SignalRequest, WriteRequest,
     },
     process::{ManagedProcess, ProcessManager, sanitize_output},
     schema,
@@ -404,12 +404,17 @@ impl ShellVibe {
         let result = async {
             let process = self.manager.get(&request.process_id)?;
             process.validate_cursor(request.cursor)?;
+            let max_bytes = request.max_bytes.unwrap_or(self.config.max_response_output);
+            if max_bytes < MIN_READ_PAGE_BYTES {
+                bail!("maxBytes must be at least {MIN_READ_PAGE_BYTES} bytes");
+            }
+            let max_bytes = max_bytes.min(self.config.max_response_output);
             let wait =
                 Duration::from_millis(request.wait_ms.unwrap_or(0)).min(self.config.max_read_wait);
             if !wait.is_zero() {
                 process.wait_for_change(request.cursor, wait).await;
             }
-            process.read_result(request.cursor)
+            process.read_result(request.cursor, max_bytes)
         }
         .await;
         match result {
@@ -815,7 +820,7 @@ mod tests {
             yield_after: Duration::from_millis(20),
             max_runtime: Duration::from_secs(10),
             max_output: 2 * 1024 * 1024,
-            max_response_output: 256 * 1024,
+            max_response_output: 32 * 1024,
             max_task_result_output: 16 * 1024,
             max_processes: 8,
             max_process_handles: 16,
@@ -856,6 +861,135 @@ mod tests {
         assert!(limiter.check().is_ok());
         assert!(limiter.check().is_ok());
         assert!(limiter.check().is_err());
+    }
+
+    #[cfg(unix)]
+    async fn spawn_test_process(server: &ShellVibe, command: &str) -> Arc<ManagedProcess> {
+        let request = decode::<ShellRequest>(arguments(json!({
+            "command": command,
+            "execution": "background"
+        })))
+        .unwrap();
+        let (spec, _) = server.build_spec(request).unwrap();
+        server.manager.spawn(spec).await.unwrap()
+    }
+
+    #[cfg(unix)]
+    fn read_value(result: CallToolResult) -> Value {
+        result.structured_content.unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_read_returns_terminal_state_when_a_silent_process_exits() {
+        let server = ShellVibe::new(test_config());
+        let process = spawn_test_process(&server, "sleep 0.08").await;
+
+        let result = read_value(
+            server
+                .call_read(ReadRequest {
+                    process_id: process.id().to_string(),
+                    cursor: 0,
+                    wait_ms: Some(1_000),
+                    max_bytes: None,
+                })
+                .await,
+        );
+
+        assert_eq!(result["status"], "exited");
+        assert_eq!(result["exitCode"], 0);
+        assert!(result["events"].as_array().unwrap().is_empty());
+        server.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spurious_notifications_do_not_end_shell_read_early() {
+        let server = ShellVibe::new(test_config());
+        let process = spawn_test_process(&server, "sleep 0.5").await;
+        let reader = server.clone();
+        let process_id = process.id().to_string();
+        let started = Instant::now();
+        let read = tokio::spawn(async move {
+            reader
+                .call_read(ReadRequest {
+                    process_id,
+                    cursor: 0,
+                    wait_ms: Some(150),
+                    max_bytes: None,
+                })
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process.notify_for_test();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!read.is_finished());
+
+        let result = read_value(read.await.unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(120));
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["hasMore"], false);
+        assert!(result["events"].as_array().unwrap().is_empty());
+        server.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_read_max_bytes_is_configurable_and_server_capped() {
+        let server = ShellVibe::new(test_config());
+        let process = spawn_test_process(
+            &server,
+            "yes 0123456789abcdef | head -c 131072; printf 'PAGE-END'",
+        )
+        .await;
+        process.wait_until_terminal().await;
+
+        let first = read_value(
+            server
+                .call_read(ReadRequest {
+                    process_id: process.id().to_string(),
+                    cursor: 0,
+                    wait_ms: None,
+                    max_bytes: Some(12 * 1024),
+                })
+                .await,
+        );
+        let first_bytes: usize = first["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["data"].as_str().unwrap().len())
+            .sum();
+        assert!(first_bytes <= 12 * 1024);
+        assert!(
+            first["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|event| event["data"].as_str().unwrap().len() <= 12 * 1024)
+        );
+        assert_eq!(first["hasMore"], true);
+
+        let capped = read_value(
+            server
+                .call_read(ReadRequest {
+                    process_id: process.id().to_string(),
+                    cursor: first["nextCursor"].as_u64().unwrap(),
+                    wait_ms: None,
+                    max_bytes: Some(1024 * 1024),
+                })
+                .await,
+        );
+        let capped_bytes: usize = capped["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["data"].as_str().unwrap().len())
+            .sum();
+        assert!(capped_bytes <= 32 * 1024);
+        assert!(capped_bytes > 12 * 1024);
+        server.shutdown().await;
     }
 
     #[cfg(unix)]
@@ -1285,6 +1419,17 @@ mod tests {
             assert_eq!(retained["cursorLost"], false);
             let events = retained["events"].as_array().unwrap();
             assert!(!events.is_empty());
+            let page_bytes: usize = events
+                .iter()
+                .map(|event| event["data"].as_str().unwrap().len())
+                .sum();
+            assert!(page_bytes <= 32 * 1024);
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["data"].as_str().unwrap().len() <= 32 * 1024)
+            );
+            assert!(serde_json::to_vec(&retained).unwrap().len() < 36 * 1024);
             for event in events {
                 let event_cursor = event["cursor"].as_u64().unwrap();
                 assert_eq!(event_cursor, previous_event_cursor + 1);
