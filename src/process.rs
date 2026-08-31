@@ -22,8 +22,8 @@ const MAX_OUTPUT_EVENT_BYTES: usize = 8 * 1024;
 use crate::{
     config::Config,
     model::{
-        CommandMode, CommandSpec, OutputEvent, OutputStream, ProcessSnapshot, ProcessStatus,
-        SignalKind,
+        CommandMode, CommandSpec, OutputEvent, OutputStream, ProcessReadResult, ProcessStatus,
+        ResizeResult, ShellResult, SignalKind, SignalResult, WriteResult,
     },
 };
 
@@ -66,7 +66,6 @@ struct OutputBuffer {
     dropped_bytes: u64,
     truncated: bool,
     last_output: Instant,
-    started: Instant,
 }
 
 impl OutputBuffer {
@@ -80,7 +79,6 @@ impl OutputBuffer {
             dropped_bytes: 0,
             truncated: false,
             last_output: started,
-            started,
         }
     }
 
@@ -88,11 +86,6 @@ impl OutputBuffer {
         if text.is_empty() {
             return;
         }
-        let text = sanitize_output(text);
-        if text.is_empty() {
-            return;
-        }
-
         let mut start = 0;
         while start < text.len() {
             let mut end = start.saturating_add(self.max_event_bytes).min(text.len());
@@ -120,7 +113,6 @@ impl OutputBuffer {
             cursor,
             stream,
             data,
-            at_ms: millis(self.started.elapsed()),
         });
 
         while self.retained_bytes > self.max_bytes {
@@ -139,7 +131,7 @@ impl OutputBuffer {
             .events
             .front()
             .map_or(self.next_cursor, |event| event.cursor);
-        let cursor_lost = cursor > 0 && cursor < first_available.saturating_sub(1);
+        let cursor_lost = cursor < first_available.saturating_sub(1);
         let mut events = Vec::new();
         let mut used = 0usize;
         let mut next_cursor = cursor;
@@ -164,9 +156,38 @@ impl OutputBuffer {
 
     fn recent_excerpt(&self) -> Option<String> {
         self.events
-            .back()
-            .map(|event| truncate_chars(event.data.lines().last().unwrap_or_default().trim(), 160))
-            .filter(|text| !text.is_empty())
+            .iter()
+            .rev()
+            .flat_map(|event| event.data.lines().rev())
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| truncate_chars(&sanitize_status(line), 200))
+    }
+
+    fn tail(&self, max_bytes: usize) -> (String, bool, u64) {
+        let mut remaining = max_bytes;
+        let mut reverse_chunks = Vec::new();
+        for event in self.events.iter().rev() {
+            if remaining == 0 {
+                break;
+            }
+            let data = &event.data;
+            if data.len() <= remaining {
+                reverse_chunks.push(data.as_str());
+                remaining -= data.len();
+            } else {
+                let mut start = data.len() - remaining;
+                while start < data.len() && !data.is_char_boundary(start) {
+                    start += 1;
+                }
+                reverse_chunks.push(&data[start..]);
+                remaining = 0;
+            }
+        }
+        reverse_chunks.reverse();
+        let output = reverse_chunks.concat();
+        let truncated = self.truncated || output.len() < self.retained_bytes;
+        (output, truncated, self.newest_cursor())
     }
 
     fn newest_cursor(&self) -> u64 {
@@ -226,6 +247,44 @@ pub(crate) fn sanitize_output(input: &str) -> String {
         .chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
         .collect()
+}
+
+fn sanitize_status(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            if !ch.is_control() || matches!(ch, '\n' | '\r' | '\t') {
+                output.push(ch);
+            }
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                let mut escaped = false;
+                for next in chars.by_ref() {
+                    if next == '\u{7}' || (escaped && next == '\\') {
+                        break;
+                    }
+                    escaped = next == '\u{1b}';
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    output
 }
 
 enum ProcessInput {
@@ -300,7 +359,11 @@ impl ManagedProcess {
     }
 
     pub fn is_running(&self) -> bool {
-        self.state.lock().expect("state mutex poisoned").status == ProcessStatus::Running
+        self.status() == ProcessStatus::Running
+    }
+
+    pub fn status(&self) -> ProcessStatus {
+        self.state.lock().expect("state mutex poisoned").status
     }
 
     fn root_exited(&self) -> bool {
@@ -534,60 +597,108 @@ impl ManagedProcess {
             > cursor
     }
 
-    pub fn snapshot(&self, cursor: u64) -> ProcessSnapshot {
-        self.snapshot_with_limit(cursor, self.max_response_output)
-    }
-
-    pub fn snapshot_with_limit(&self, cursor: u64, max_output_bytes: usize) -> ProcessSnapshot {
-        let now = Instant::now();
-        let state = self.state.lock().expect("state mutex poisoned").clone();
-        let output = self.output.lock().expect("output mutex poisoned");
-        let max_output_bytes = max_output_bytes.min(self.max_response_output);
-        let (events, next_cursor, cursor_lost, has_more) =
-            output.read_since(cursor, max_output_bytes);
-        let elapsed = now.duration_since(self.started);
-        let idle = now.duration_since(output.last_output);
-        let message = status_message(
-            &self.spec.display_name(),
-            state.status,
-            state.exit_code,
-            elapsed,
-            idle,
-        );
+    pub fn start_result(&self) -> ShellResult {
         let (rows, cols) = *self.pty_size.lock().expect("PTY size mutex poisoned");
-        let (command, command_truncated) = self.spec.command_text();
-        let (argv, argv_truncated) = self.spec.argv();
-
-        ProcessSnapshot {
+        ShellResult {
             process_id: self.id.clone(),
-            status: state.status,
+            status: self.status(),
             pid: self.pid,
-            mode: self.spec.display_mode().to_string(),
-            execution: self.spec.execution,
             pty: self.spec.pty,
             rows: self.spec.pty.then_some(rows),
             cols: self.spec.pty.then_some(cols),
-            command: command.map(|value| sanitize_output(&value)),
-            command_truncated,
-            argv: argv.map(|values| {
-                values
-                    .into_iter()
-                    .map(|value| sanitize_output(&value))
-                    .collect()
-            }),
-            argv_truncated,
-            cwd: sanitize_output(&self.spec.cwd.to_string_lossy()),
+            exit_code: None,
+            signal: None,
+            elapsed_ms: None,
+            output: None,
+            output_truncated: None,
+            next_cursor: 0,
+        }
+    }
+
+    pub fn completion_result(&self, max_output_bytes: usize) -> ShellResult {
+        let state = self.state.lock().expect("state mutex poisoned").clone();
+        let output = self.output.lock().expect("output mutex poisoned");
+        let (tail, output_truncated, next_cursor) =
+            output.tail(max_output_bytes.min(self.max_response_output));
+        let (rows, cols) = *self.pty_size.lock().expect("PTY size mutex poisoned");
+        ShellResult {
+            process_id: self.id.clone(),
+            status: state.status,
+            pid: self.pid,
+            pty: self.spec.pty,
+            rows: self.spec.pty.then_some(rows),
+            cols: self.spec.pty.then_some(cols),
             exit_code: state.exit_code,
-            signal: state.signal.map(|value| sanitize_output(&value)),
+            signal: state.signal.map(|value| sanitize_status(&value)),
+            elapsed_ms: Some(millis(self.started.elapsed())),
+            output: Some(tail),
+            output_truncated: Some(output_truncated),
+            next_cursor,
+        }
+    }
+
+    pub fn read_result(&self, cursor: u64) -> anyhow::Result<ProcessReadResult> {
+        let state = self.state.lock().expect("state mutex poisoned").clone();
+        let output = self.output.lock().expect("output mutex poisoned");
+        let newest_cursor = output.newest_cursor();
+        if cursor > newest_cursor {
+            bail!("cursor {cursor} is ahead of the newest cursor {newest_cursor}");
+        }
+        let (events, next_cursor, cursor_lost, has_more) =
+            output.read_since(cursor, self.max_response_output);
+        let terminal = state.status.is_terminal();
+        Ok(ProcessReadResult {
+            process_id: self.id.clone(),
+            status: state.status,
             events,
             next_cursor,
             has_more,
             cursor_lost,
-            elapsed_ms: millis(elapsed),
-            idle_ms: millis(idle),
-            truncated: output.truncated,
-            dropped_bytes: output.dropped_bytes,
-            message,
+            exit_code: terminal.then_some(state.exit_code).flatten(),
+            signal: terminal
+                .then_some(state.signal)
+                .flatten()
+                .map(|value| sanitize_status(&value)),
+            elapsed_ms: terminal.then_some(millis(self.started.elapsed())),
+        })
+    }
+
+    pub fn validate_cursor(&self, cursor: u64) -> anyhow::Result<()> {
+        let newest_cursor = self
+            .output
+            .lock()
+            .expect("output mutex poisoned")
+            .newest_cursor();
+        if cursor > newest_cursor {
+            bail!("cursor {cursor} is ahead of the newest cursor {newest_cursor}");
+        }
+        Ok(())
+    }
+
+    pub fn write_result(&self, accepted_bytes: usize, stdin_closed: bool) -> WriteResult {
+        WriteResult {
+            process_id: self.id.clone(),
+            accepted_bytes,
+            stdin_closed,
+            status: self.status(),
+        }
+    }
+
+    pub fn signal_result(&self, signal: SignalKind, accepted: bool) -> SignalResult {
+        SignalResult {
+            process_id: self.id.clone(),
+            signal: signal.as_str().to_ascii_lowercase(),
+            accepted,
+            status: self.status(),
+        }
+    }
+
+    pub fn resize_result(&self, rows: u16, cols: u16) -> ResizeResult {
+        ResizeResult {
+            process_id: self.id.clone(),
+            rows,
+            cols,
+            status: self.status(),
         }
     }
 
@@ -596,21 +707,26 @@ impl ManagedProcess {
         let output = self.output.lock().expect("output mutex poisoned");
         let elapsed = self.started.elapsed();
         let idle = Instant::now().duration_since(output.last_output);
-        let mut message = status_message(
-            &self.spec.display_name(),
-            state.status,
-            state.exit_code,
-            elapsed,
-            idle,
-        );
-        if let Some(excerpt) = output.recent_excerpt() {
-            message.push_str(" · ");
-            message.push_str(&excerpt);
-        }
+        let activity = output.recent_excerpt().unwrap_or_else(|| {
+            if state.status == ProcessStatus::Running {
+                format!("idle {}", human_duration(idle))
+            } else {
+                truncate_chars(&sanitize_status(&self.spec.display_name()), 100)
+            }
+        });
+        let mut message = match state.status {
+            ProcessStatus::Running => {
+                format!("Running · {} · {activity}", human_duration(elapsed))
+            }
+            _ => format!(
+                "{} · {activity}",
+                status_message(state.status, state.exit_code, elapsed)
+            ),
+        };
         if output.truncated {
             message.push_str(" · output truncated");
         }
-        message
+        truncate_chars(&message, 240)
     }
 
     fn finished_for(&self) -> Option<Duration> {
@@ -1256,47 +1372,18 @@ async fn signal_tree(control: &ProcessControl, signal: SignalKind) -> anyhow::Re
     bail!("process signalling is not supported on this platform");
 }
 
-fn status_message(
-    command: &str,
-    status: ProcessStatus,
-    exit_code: Option<i32>,
-    elapsed: Duration,
-    idle: Duration,
-) -> String {
-    let command = sanitize_output(command);
+fn status_message(status: ProcessStatus, exit_code: Option<i32>, elapsed: Duration) -> String {
     match status {
-        ProcessStatus::Running => format!(
-            "Running for {} · idle for {} · {}",
-            human_duration(elapsed),
-            human_duration(idle),
-            truncate_chars(&command, 100)
-        ),
+        ProcessStatus::Running => format!("Running · {}", human_duration(elapsed)),
         ProcessStatus::Exited => format!(
-            "Exited with code {} after {} · {}",
+            "Exited with code {} · {}",
             exit_code.unwrap_or(-1),
-            human_duration(elapsed),
-            truncate_chars(&command, 100)
+            human_duration(elapsed)
         ),
-        ProcessStatus::Signaled => format!(
-            "Terminated by signal after {} · {}",
-            human_duration(elapsed),
-            truncate_chars(&command, 100)
-        ),
-        ProcessStatus::TimedOut => format!(
-            "Timed out after {} · {}",
-            human_duration(elapsed),
-            truncate_chars(&command, 100)
-        ),
-        ProcessStatus::Cancelled => format!(
-            "Cancelled after {} · {}",
-            human_duration(elapsed),
-            truncate_chars(&command, 100)
-        ),
-        ProcessStatus::Failed => format!(
-            "Process failed after {} · {}",
-            human_duration(elapsed),
-            truncate_chars(&command, 100)
-        ),
+        ProcessStatus::Signaled => format!("Terminated by signal · {}", human_duration(elapsed)),
+        ProcessStatus::TimedOut => format!("Timed out · {}", human_duration(elapsed)),
+        ProcessStatus::Cancelled => format!("Cancelled · {}", human_duration(elapsed)),
+        ProcessStatus::Failed => format!("Process failed · {}", human_duration(elapsed)),
     }
 }
 
@@ -1358,6 +1445,36 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "abcd");
         assert!(has_more);
+    }
+
+    #[test]
+    fn output_tail_is_bounded_and_preserves_final_text() {
+        let mut buffer = OutputBuffer::new(64, 16, Instant::now());
+        buffer.append(OutputStream::Stdout, "0123456789");
+        buffer.append(OutputStream::Stderr, "final-line\n");
+        let (tail, truncated, cursor) = buffer.tail(11);
+        assert_eq!(tail, "final-line\n");
+        assert!(truncated);
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn retained_pty_output_keeps_terminal_sequences() {
+        let mut buffer = OutputBuffer::new(64, 64, Instant::now());
+        buffer.append(OutputStream::Pty, "\u{1b}[31mred\u{1b}[0m\n");
+        let (events, _, _, _) = buffer.read_since(0, 64);
+        assert_eq!(events[0].data, "\u{1b}[31mred\u{1b}[0m\n");
+        assert_eq!(sanitize_status(&events[0].data), "red\n");
+        assert_eq!(buffer.recent_excerpt().as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn evicted_initial_cursor_is_reported_lost() {
+        let mut buffer = OutputBuffer::new(4, 4, Instant::now());
+        buffer.append(OutputStream::Stdout, "old!");
+        buffer.append(OutputStream::Stdout, "new!");
+        let (_, _, cursor_lost, _) = buffer.read_since(0, 4);
+        assert!(cursor_lost);
     }
 
     #[test]

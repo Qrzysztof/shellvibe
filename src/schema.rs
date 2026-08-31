@@ -81,7 +81,7 @@ fn shell_tool(policy: &ExecPolicy) -> Tool {
 
     Tool::new("shell", description, arc_object(schema))
         .with_title("Run shell process")
-        .with_raw_output_schema(arc_object(tool_output_schema()))
+        .with_raw_output_schema(arc_object(tool_output_schema(shell_result_schema())))
         .with_annotations(
             ToolAnnotations::new()
                 .read_only(false)
@@ -119,7 +119,7 @@ fn common_shell_properties() -> JsonObject {
 fn read_tool() -> Tool {
     Tool::new(
         "shell_read",
-        "Read retained output from a process using a monotonic cursor. If no new output exists and the process is still running, wait up to waitMs. nextCursor is the cursor to pass on the next call; hasMore means another immediate read is useful.",
+        "Canonical output retrieval for a managed process. Returns only events after the monotonic cursor and may wait up to waitMs for output or a state change. nextCursor is the cursor for the next read; hasMore means another immediate read is useful.",
         arc_object(json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -133,7 +133,7 @@ fn read_tool() -> Tool {
         })),
     )
     .with_title("Read process output")
-    .with_raw_output_schema(arc_object(tool_output_schema()))
+    .with_raw_output_schema(arc_object(tool_output_schema(read_result_schema())))
     .with_annotations(
         ToolAnnotations::new()
             .read_only(true)
@@ -146,7 +146,7 @@ fn read_tool() -> Tool {
 fn write_tool() -> Tool {
     Tool::new(
         "shell_write",
-        "Write UTF-8 input to a running process stdin/PTY and optionally close stdin to deliver EOF. Use terminal input here; do not use MCP MRTR to guess arbitrary terminal prompts.",
+        "Send UTF-8 input to a running process stdin/PTY and optionally close stdin to deliver EOF. This returns an acknowledgement and does not wait for resulting output; use shell_read to observe output.",
         arc_object(json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -165,7 +165,7 @@ fn write_tool() -> Tool {
         })),
     )
     .with_title("Write process input")
-    .with_raw_output_schema(arc_object(tool_output_schema()))
+    .with_raw_output_schema(arc_object(tool_output_schema(write_result_schema())))
     .with_annotations(
         ToolAnnotations::new()
             .read_only(false)
@@ -178,7 +178,7 @@ fn write_tool() -> Tool {
 fn signal_tool() -> Tool {
     Tool::new(
         "shell_signal",
-        "Send INT, TERM, or KILL to the managed process tree. On Unix these map to POSIX signals. On Windows INT/TERM request non-forced tree termination via taskkill and KILL requests forced termination. shellvibe uses TERM followed by KILL escalation for server-managed cancellation/timeouts.",
+        "Send INT, TERM, or KILL to the managed process tree. The acknowledgement confirms the request was sent, not that the process has exited; use shell_read with waitMs to observe terminal state.",
         arc_object(json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -191,7 +191,7 @@ fn signal_tool() -> Tool {
         })),
     )
     .with_title("Signal process")
-    .with_raw_output_schema(arc_object(tool_output_schema()))
+    .with_raw_output_schema(arc_object(tool_output_schema(signal_result_schema())))
     .with_annotations(
         ToolAnnotations::new()
             .read_only(false)
@@ -204,7 +204,7 @@ fn signal_tool() -> Tool {
 fn resize_tool() -> Tool {
     Tool::new(
         "shell_resize",
-        "Resize a running PTY. This updates the kernel terminal size and lets terminal-aware programs react to the resize.",
+        "Resize a running PTY. This returns only the new dimensions and current status; accumulated terminal output remains available through shell_read.",
         arc_object(json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -218,7 +218,7 @@ fn resize_tool() -> Tool {
         })),
     )
     .with_title("Resize PTY")
-    .with_raw_output_schema(arc_object(tool_output_schema()))
+    .with_raw_output_schema(arc_object(tool_output_schema(resize_result_schema())))
     .with_annotations(
         ToolAnnotations::new()
             .read_only(false)
@@ -228,11 +228,11 @@ fn resize_tool() -> Tool {
     )
 }
 
-fn tool_output_schema() -> Value {
+fn tool_output_schema(success: Value) -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "oneOf": [
-            process_snapshot_schema(),
+            success,
             {
                 "type": "object",
                 "additionalProperties": false,
@@ -246,49 +246,97 @@ fn tool_output_schema() -> Value {
     })
 }
 
-fn process_snapshot_schema() -> Value {
+fn shell_result_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["processId", "status", "pid", "mode", "execution", "pty", "commandTruncated", "argvTruncated", "cwd", "events", "nextCursor", "hasMore", "cursorLost", "elapsedMs", "idleMs", "truncated", "droppedBytes", "message"],
+        "required": ["processId", "status", "pty", "nextCursor"],
         "properties": {
             "processId": {"type": "string", "pattern": "^p_[0-9a-f]{32}$"},
             "status": {"type": "string", "enum": ["running", "exited", "signaled", "timed_out", "cancelled", "failed"]},
-            "pid": {"type": ["integer", "null"], "minimum": 0},
-            "mode": {"type": "string", "enum": ["shell", "direct"]},
-            "execution": {"type": "string", "enum": ["foreground", "background", "interactive"]},
+            "pid": {"type": "integer", "minimum": 0},
             "pty": {"type": "boolean"},
             "rows": {"type": "integer", "minimum": 1},
             "cols": {"type": "integer", "minimum": 1},
-            "command": {"type": "string", "description": "Bounded diagnostic echo of the shell command."},
-            "commandTruncated": {"type": "boolean"},
-            "argv": {"type": "array", "items": {"type": "string"}, "description": "Bounded diagnostic echo of direct-execution arguments."},
-            "argvTruncated": {"type": "boolean"},
-            "cwd": {"type": "string"},
             "exitCode": {"type": "integer"},
             "signal": {"type": "string"},
+            "elapsedMs": {"type": "integer", "minimum": 0},
+            "output": {"type": "string", "description": "Bounded ordered output tail present for completed foreground execution."},
+            "outputTruncated": {"type": "boolean"},
+            "nextCursor": {"type": "integer", "minimum": 0}
+        }
+    })
+}
+
+fn read_result_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["processId", "status", "events", "nextCursor", "hasMore", "cursorLost"],
+        "properties": {
+            "processId": {"type": "string", "pattern": "^p_[0-9a-f]{32}$"},
+            "status": {"type": "string", "enum": ["running", "exited", "signaled", "timed_out", "cancelled", "failed"]},
             "events": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["cursor", "stream", "data", "atMs"],
+                    "required": ["cursor", "stream", "data"],
                     "properties": {
                         "cursor": {"type": "integer", "minimum": 1},
                         "stream": {"type": "string", "enum": ["stdout", "stderr", "pty"]},
-                        "data": {"type": "string"},
-                        "atMs": {"type": "integer", "minimum": 0}
+                        "data": {"type": "string"}
                     }
                 }
             },
             "nextCursor": {"type": "integer", "minimum": 0},
             "hasMore": {"type": "boolean"},
             "cursorLost": {"type": "boolean"},
-            "elapsedMs": {"type": "integer", "minimum": 0},
-            "idleMs": {"type": "integer", "minimum": 0},
-            "truncated": {"type": "boolean"},
-            "droppedBytes": {"type": "integer", "minimum": 0},
-            "message": {"type": "string"}
+            "exitCode": {"type": "integer"},
+            "signal": {"type": "string"},
+            "elapsedMs": {"type": "integer", "minimum": 0}
+        }
+    })
+}
+
+fn write_result_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["processId", "acceptedBytes", "stdinClosed", "status"],
+        "properties": {
+            "processId": {"type": "string", "pattern": "^p_[0-9a-f]{32}$"},
+            "acceptedBytes": {"type": "integer", "minimum": 0},
+            "stdinClosed": {"type": "boolean"},
+            "status": {"type": "string", "enum": ["running", "exited", "signaled", "timed_out", "cancelled", "failed"]}
+        }
+    })
+}
+
+fn signal_result_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["processId", "signal", "accepted", "status"],
+        "properties": {
+            "processId": {"type": "string", "pattern": "^p_[0-9a-f]{32}$"},
+            "signal": {"type": "string", "enum": ["int", "term", "kill"]},
+            "accepted": {"type": "boolean"},
+            "status": {"type": "string", "enum": ["running", "exited", "signaled", "timed_out", "cancelled", "failed"]}
+        }
+    })
+}
+
+fn resize_result_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["processId", "rows", "cols", "status"],
+        "properties": {
+            "processId": {"type": "string", "pattern": "^p_[0-9a-f]{32}$"},
+            "rows": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "cols": {"type": "integer", "minimum": 1, "maximum": 2000},
+            "status": {"type": "string", "enum": ["running", "exited", "signaled", "timed_out", "cancelled", "failed"]}
         }
     })
 }

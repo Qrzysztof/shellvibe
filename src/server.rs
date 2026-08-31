@@ -17,19 +17,20 @@ use rmcp::{
     service::RequestContext,
     task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions},
 };
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use tracing::debug;
 
 const MAX_TOOL_ERROR_CHARS: usize = 2_048;
 const MAX_TOOL_NAME_CHARS: usize = 128;
+const MAX_COMPLETION_OUTPUT_BYTES: usize = 8 * 1024;
 
 use crate::{
     config::{Config, duration_ms},
     model::{
         CommandMode, CommandSpec, ExecutionMode, MAX_ARG_BYTES, MAX_ARGV_BYTES, MAX_ARGV_ITEMS,
         MAX_COMMAND_BYTES, MAX_ENV_BYTES, MAX_ENV_ITEMS, MAX_PATH_BYTES, MAX_STDIN_BYTES,
-        ProcessSnapshot, ProcessStatus, ReadRequest, ResizeRequest, ShellRequest, SignalRequest,
+        ProcessStatus, ReadRequest, ResizeRequest, ShellRequest, ShellResult, SignalRequest,
         WriteRequest,
     },
     process::{ManagedProcess, ProcessManager, sanitize_output},
@@ -278,19 +279,9 @@ impl ShellVibe {
         let process = self.manager.spawn(spec).await?;
 
         match execution {
-            ExecutionMode::Background => Ok(CallToolResponse::Complete(success_result(
-                process.snapshot(0),
-            ))),
-            ExecutionMode::Interactive => {
-                // Give fast-starting REPLs a tiny opportunity to expose their prompt
-                // without delaying the background-style lifecycle.
-                process
-                    .wait_for_change(0, yield_after.min(Duration::from_millis(150)))
-                    .await;
-                Ok(CallToolResponse::Complete(success_result(
-                    process.snapshot(0),
-                )))
-            }
+            ExecutionMode::Background | ExecutionMode::Interactive => Ok(
+                CallToolResponse::Complete(success_result(process.start_result())),
+            ),
             ExecutionMode::Foreground => {
                 self.run_foreground(process, yield_after, progress_token, context)
                     .await
@@ -326,8 +317,8 @@ impl ShellVibe {
 
         loop {
             if !process.is_running() {
-                return Ok(CallToolResponse::Complete(result_for_snapshot(
-                    process.snapshot(0),
+                return Ok(CallToolResponse::Complete(result_for_shell(
+                    process.completion_result(self.completion_output_budget()),
                 )));
             }
 
@@ -340,20 +331,26 @@ impl ShellVibe {
                             self.config.termination_grace,
                         )
                         .await?;
-                    return Ok(CallToolResponse::Complete(result_for_snapshot(process.snapshot(0))));
+                    return Ok(CallToolResponse::Complete(result_for_shell(
+                        process.completion_result(self.completion_output_budget()),
+                    )));
                 }
                 _ = &mut deadline => {
                     if !process.is_running() {
-                        return Ok(CallToolResponse::Complete(result_for_snapshot(process.snapshot(0))));
+                        return Ok(CallToolResponse::Complete(result_for_shell(
+                            process.completion_result(self.completion_output_budget()),
+                        )));
                     }
                     if supports_tasks {
                         return Ok(self.create_process_task(process));
                     }
-                    return Ok(CallToolResponse::Complete(success_result(process.snapshot(0))));
+                    return Ok(CallToolResponse::Complete(success_result(process.start_result())));
                 }
                 _ = process.wait_for_notification() => {
                     if !process.is_running() {
-                        return Ok(CallToolResponse::Complete(result_for_snapshot(process.snapshot(0))));
+                        return Ok(CallToolResponse::Complete(result_for_shell(
+                            process.completion_result(self.completion_output_budget()),
+                        )));
                     }
                 }
                 _ = interval.tick() => {
@@ -397,15 +394,22 @@ impl ShellVibe {
         CallToolResponse::Task(CreateTaskResult::new(task))
     }
 
+    fn completion_output_budget(&self) -> usize {
+        self.config
+            .max_task_result_output
+            .min(MAX_COMPLETION_OUTPUT_BYTES)
+    }
+
     async fn call_read(&self, request: ReadRequest) -> CallToolResult {
         let result = async {
             let process = self.manager.get(&request.process_id)?;
+            process.validate_cursor(request.cursor)?;
             let wait =
                 Duration::from_millis(request.wait_ms.unwrap_or(0)).min(self.config.max_read_wait);
             if !wait.is_zero() {
                 process.wait_for_change(request.cursor, wait).await;
             }
-            Ok::<_, anyhow::Error>(process.snapshot(request.cursor))
+            process.read_result(request.cursor)
         }
         .await;
         match result {
@@ -427,16 +431,18 @@ impl ShellVibe {
             }) {
                 bail!("shell_write data exceeds the maximum size of {MAX_STDIN_BYTES} bytes");
             }
+            let mut accepted_bytes = 0;
             if let Some(mut data) = request.data {
                 if request.append_newline {
                     data.push('\n');
                 }
+                accepted_bytes = data.len();
                 process.write(data.as_bytes()).await?;
             }
             if request.close_stdin {
                 process.close_stdin().await;
             }
-            Ok::<_, anyhow::Error>(process.snapshot(0))
+            Ok::<_, anyhow::Error>(process.write_result(accepted_bytes, request.close_stdin))
         }
         .await;
         match result {
@@ -448,14 +454,9 @@ impl ShellVibe {
     async fn call_signal(&self, request: SignalRequest) -> CallToolResult {
         let result = async {
             let process = self.manager.get(&request.process_id)?;
+            let accepted = process.is_running();
             process.signal(request.signal).await?;
-            if process.is_running() {
-                let cursor = process.snapshot(0).next_cursor;
-                process
-                    .wait_for_change(cursor, Duration::from_millis(75))
-                    .await;
-            }
-            Ok::<_, anyhow::Error>(process.snapshot(0))
+            Ok::<_, anyhow::Error>(process.signal_result(request.signal, accepted))
         }
         .await;
         match result {
@@ -468,7 +469,7 @@ impl ShellVibe {
         let result = async {
             let process = self.manager.get(&request.process_id)?;
             process.resize(request.rows, request.cols).await?;
-            Ok::<_, anyhow::Error>(process.snapshot(0))
+            Ok::<_, anyhow::Error>(process.resize_result(request.rows, request.cols))
         }
         .await;
         match result {
@@ -532,9 +533,9 @@ async fn run_process_task(
     loop {
         if !process.is_running() {
             guard.disarm();
-            return Ok(result_for_snapshot(
-                process.snapshot_with_limit(0, max_task_result_output),
-            ));
+            return Ok(result_for_shell(process.completion_result(
+                max_task_result_output.min(MAX_COMPLETION_OUTPUT_BYTES),
+            )));
         }
 
         tokio::select! {
@@ -548,7 +549,8 @@ async fn run_process_task(
                         None,
                     )));
                 }
-                let snapshot = process.snapshot_with_limit(0, max_task_result_output);
+                let snapshot = process
+                    .completion_result(max_task_result_output.min(MAX_COMPLETION_OUTPUT_BYTES));
                 if snapshot.status == ProcessStatus::Cancelled {
                     return Err(TaskExit::Cancelled);
                 }
@@ -556,13 +558,12 @@ async fn run_process_task(
                 // with cancellation. Preserve that real terminal outcome instead
                 // of masking it as a cancelled Task.
                 guard.disarm();
-                return Ok(result_for_snapshot(snapshot));
+                return Ok(result_for_shell(snapshot));
             }
             _ = process.wait_for_notification() => {
                 if !process.is_running() {
-                    return Ok(result_for_snapshot(process.snapshot_with_limit(
-                        0,
-                        max_task_result_output,
+                    return Ok(result_for_shell(process.completion_result(
+                        max_task_result_output.min(MAX_COMPLETION_OUTPUT_BYTES),
                     )));
                 }
             }
@@ -746,23 +747,26 @@ fn decode<T: DeserializeOwned>(arguments: Map<String, Value>) -> anyhow::Result<
     serde_json::from_value(Value::Object(arguments)).context("invalid tool arguments")
 }
 
-fn result_for_snapshot(snapshot: ProcessSnapshot) -> CallToolResult {
-    let is_failure = snapshot.status.is_terminal()
-        && !(snapshot.status == ProcessStatus::Exited && snapshot.exit_code == Some(0));
+fn result_for_shell(result: ShellResult) -> CallToolResult {
+    let is_failure = result.status.is_terminal()
+        && !(result.status == ProcessStatus::Exited && result.exit_code == Some(0));
     if is_failure {
-        snapshot_result(snapshot, true)
+        shell_result(result, true)
     } else {
-        snapshot_result(snapshot, false)
+        shell_result(result, false)
     }
 }
 
-fn success_result(snapshot: ProcessSnapshot) -> CallToolResult {
-    snapshot_result(snapshot, false)
+fn success_result<T: Serialize>(result: T) -> CallToolResult {
+    structured_result(result, false)
 }
 
-fn snapshot_result(snapshot: ProcessSnapshot, is_error: bool) -> CallToolResult {
-    let structured =
-        serde_json::to_value(&snapshot).expect("ProcessSnapshot serialization is infallible");
+fn shell_result(result: ShellResult, is_error: bool) -> CallToolResult {
+    structured_result(result, is_error)
+}
+
+fn structured_result<T: Serialize>(result: T, is_error: bool) -> CallToolResult {
+    let structured = serde_json::to_value(result).expect("tool result serialization is infallible");
     if is_error {
         CallToolResult::structured_error(structured)
     } else {
@@ -797,6 +801,44 @@ fn bounded_text(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::ExecPolicy;
+    use rmcp::{
+        ServiceExt,
+        model::{ClientInfo, ResultType, TaskPayload},
+    };
+
+    fn test_config() -> Config {
+        Config {
+            policy: ExecPolicy::Unrestricted,
+            workdir: std::env::current_dir().unwrap(),
+            shell: "/bin/sh".into(),
+            yield_after: Duration::from_millis(20),
+            max_runtime: Duration::from_secs(10),
+            max_output: 2 * 1024 * 1024,
+            max_response_output: 256 * 1024,
+            max_task_result_output: 16 * 1024,
+            max_processes: 8,
+            max_process_handles: 16,
+            max_tool_calls_per_minute: 100,
+            progress_interval: Duration::from_millis(10),
+            max_read_wait: Duration::from_secs(1),
+            process_retention: Duration::from_secs(5),
+            task_ttl: Duration::from_secs(10),
+            task_poll_interval: Duration::from_millis(10),
+            termination_grace: Duration::from_millis(100),
+        }
+    }
+
+    fn arguments(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    fn complete_value(response: CallToolResponse) -> Value {
+        let CallToolResponse::Complete(result) = response else {
+            panic!("expected complete tool response");
+        };
+        result.structured_content.unwrap()
+    }
 
     #[test]
     fn tool_errors_have_structured_output() {
@@ -814,5 +856,435 @@ mod tests {
         assert!(limiter.check().is_ok());
         assert!(limiter.check().is_ok());
         assert!(limiter.check().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tasks_are_negotiated_on_the_real_tool_call() {
+        let server = ShellVibe::new(test_config());
+        let shutdown = server.clone();
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = ClientInfo::new(
+            ClientCapabilities::builder().enable_tasks().build(),
+            Implementation::new("shellvibe-test", "0"),
+        )
+        .serve(client_transport)
+        .await
+        .unwrap();
+
+        let fast = client
+            .call_tool_once(
+                CallToolRequestParams::new("shell")
+                    .with_arguments(arguments(json!({"command": "printf fast"}))),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(fast, CallToolResponse::Complete(_)));
+
+        let long = client
+            .call_tool_once(
+                CallToolRequestParams::new("shell").with_arguments(arguments(json!({
+                    "command": "sleep 0.15; printf task-final",
+                    "yieldMs": 20
+                }))),
+            )
+            .await
+            .unwrap();
+        let CallToolResponse::Task(created) = long else {
+            panic!("expected Tasks-capable call to return a Task");
+        };
+        assert_eq!(created.result_type, ResultType::TASK);
+
+        let completed = loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let task = client
+                .peer()
+                .get_task(GetTaskParams::new(created.task.task_id.clone()))
+                .await
+                .unwrap()
+                .task;
+            if task.status().is_terminal() {
+                break task;
+            }
+        };
+        let TaskPayload::Completed { result } = completed.payload else {
+            panic!("expected completed Task payload");
+        };
+        let result: CallToolResult = serde_json::from_value(Value::Object(result)).unwrap();
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["output"], "task-final");
+
+        let cancellable = client
+            .call_tool_once(
+                CallToolRequestParams::new("shell").with_arguments(arguments(json!({
+                    "command": "sleep 5",
+                    "yieldMs": 20
+                }))),
+            )
+            .await
+            .unwrap();
+        let CallToolResponse::Task(cancellable) = cancellable else {
+            panic!("expected cancellable call to return a Task");
+        };
+        client
+            .peer()
+            .cancel_task(CancelTaskParams::new(cancellable.task.task_id.clone()))
+            .await
+            .unwrap();
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let task = client
+                .peer()
+                .get_task(GetTaskParams::new(cancellable.task.task_id.clone()))
+                .await
+                .unwrap()
+                .task;
+            if task.status().is_terminal() {
+                assert_eq!(task.status(), rmcp::model::TaskStatus::Cancelled);
+                break;
+            }
+        }
+
+        client.cancel().await.unwrap();
+        shutdown.shutdown().await;
+        server_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fallback_and_control_results_are_compact() {
+        let server = ShellVibe::new(test_config());
+        let shutdown = server.clone();
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = ClientInfo::new(
+            ClientCapabilities::default(),
+            Implementation::new("shellvibe-test", "0"),
+        )
+        .serve(client_transport)
+        .await
+        .unwrap();
+
+        let fallback = complete_value(
+            client
+                .call_tool_once(
+                    CallToolRequestParams::new("shell").with_arguments(arguments(json!({
+                        "command": "sleep 5",
+                        "yieldMs": 20
+                    }))),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(fallback["status"], "running");
+        let fallback_id = fallback["processId"].as_str().unwrap();
+        let _ = client
+            .call_tool_once(
+                CallToolRequestParams::new("shell_signal").with_arguments(arguments(json!({
+                    "processId": fallback_id,
+                    "signal": "kill"
+                }))),
+            )
+            .await
+            .unwrap();
+
+        let background = complete_value(
+            client
+                .call_tool_once(
+                    CallToolRequestParams::new("shell").with_arguments(arguments(json!({
+                        "command": "printf background-ready; sleep 5",
+                        "execution": "background"
+                    }))),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(background["nextCursor"], 0);
+        let background_id = background["processId"].as_str().unwrap();
+        let background_read = complete_value(
+            client
+                .call_tool_once(
+                    CallToolRequestParams::new("shell_read").with_arguments(arguments(json!({
+                        "processId": background_id,
+                        "cursor": 0,
+                        "waitMs": 500
+                    }))),
+                )
+                .await
+                .unwrap(),
+        );
+        let background_output: String = background_read["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["data"].as_str().unwrap())
+            .collect();
+        assert!(background_output.contains("background-ready"));
+        let _ = client
+            .call_tool_once(
+                CallToolRequestParams::new("shell_signal").with_arguments(arguments(json!({
+                    "processId": background_id,
+                    "signal": "kill"
+                }))),
+            )
+            .await
+            .unwrap();
+
+        let started = complete_value(
+            client
+                .call_tool_once(
+                    CallToolRequestParams::new("shell").with_arguments(arguments(json!({
+                        "command": "printf interactive-ready; cat",
+                        "execution": "interactive"
+                    }))),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(started["nextCursor"], 0);
+        let process_id = started["processId"].as_str().unwrap();
+
+        let early_output = complete_value(
+            client
+                .call_tool_once(
+                    CallToolRequestParams::new("shell_read").with_arguments(arguments(json!({
+                        "processId": process_id,
+                        "cursor": 0,
+                        "waitMs": 500
+                    }))),
+                )
+                .await
+                .unwrap(),
+        );
+        let early_output: String = early_output["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["data"].as_str().unwrap())
+            .collect();
+        assert!(early_output.contains("interactive-ready"));
+
+        let future_cursor = complete_value(
+            client
+                .call_tool_once(
+                    CallToolRequestParams::new("shell_read").with_arguments(arguments(json!({
+                        "processId": process_id,
+                        "cursor": 999,
+                        "waitMs": 1000
+                    }))),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(future_cursor["error"], "shellvibe_error");
+        assert!(future_cursor["message"].as_str().unwrap().contains("ahead"));
+
+        let write = complete_value(
+            client
+                .call_tool_once(CallToolRequestParams::new("shell_write").with_arguments(
+                    arguments(json!({
+                        "processId": process_id,
+                        "data": "hello",
+                        "appendNewline": true
+                    })),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(write["acceptedBytes"], 6);
+        assert!(write.get("events").is_none());
+        assert!(write.get("output").is_none());
+
+        let resize = complete_value(
+            client
+                .call_tool_once(CallToolRequestParams::new("shell_resize").with_arguments(
+                    arguments(json!({
+                        "processId": process_id,
+                        "rows": 30,
+                        "cols": 100
+                    })),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(resize["rows"], 30);
+        assert!(resize.get("events").is_none());
+
+        let signal = complete_value(
+            client
+                .call_tool_once(CallToolRequestParams::new("shell_signal").with_arguments(
+                    arguments(json!({
+                        "processId": process_id,
+                        "signal": "term"
+                    })),
+                ))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(signal["accepted"], true);
+        assert!(signal.get("events").is_none());
+
+        client.cancel().await.unwrap();
+        shutdown.shutdown().await;
+        server_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_large_output_returns_a_bounded_tail() {
+        let server = ShellVibe::new(test_config());
+        let shutdown = server.clone();
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = ClientInfo::new(
+            ClientCapabilities::default(),
+            Implementation::new("shellvibe-test", "0"),
+        )
+        .serve(client_transport)
+        .await
+        .unwrap();
+
+        let result = complete_value(
+            client
+                .call_tool_once(
+                    CallToolRequestParams::new("shell").with_arguments(arguments(json!({
+                        "command": "yes 0123456789 | head -c 1048576; printf '\\nFINAL\\n'",
+                        "yieldMs": 5000
+                    }))),
+                )
+                .await
+                .unwrap(),
+        );
+        let output = result["output"].as_str().unwrap();
+        assert!(output.len() <= MAX_COMPLETION_OUTPUT_BYTES);
+        assert!(output.ends_with("FINAL\n"));
+        assert_eq!(result["outputTruncated"], true);
+        assert!(serde_json::to_vec(&result).unwrap().len() < 9 * 1024);
+        let process_id = result["processId"].as_str().unwrap();
+        let mut cursor = 0_u64;
+        let mut previous_event_cursor = 0_u64;
+        let mut pages = 0;
+        let mut retained_output = String::new();
+        loop {
+            let retained = complete_value(
+                client
+                    .call_tool_once(CallToolRequestParams::new("shell_read").with_arguments(
+                        arguments(json!({
+                            "processId": process_id,
+                            "cursor": cursor
+                        })),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            pages += 1;
+            assert_eq!(retained["cursorLost"], false);
+            let events = retained["events"].as_array().unwrap();
+            assert!(!events.is_empty());
+            for event in events {
+                let event_cursor = event["cursor"].as_u64().unwrap();
+                assert_eq!(event_cursor, previous_event_cursor + 1);
+                previous_event_cursor = event_cursor;
+                retained_output.push_str(event["data"].as_str().unwrap());
+            }
+            let next_cursor = retained["nextCursor"].as_u64().unwrap();
+            assert_eq!(next_cursor, previous_event_cursor);
+            assert!(next_cursor > cursor);
+            cursor = next_cursor;
+            if retained["hasMore"] == false {
+                break;
+            }
+        }
+        assert!(pages > 1);
+        assert!(retained_output.len() >= 1024 * 1024);
+        assert!(retained_output.ends_with("FINAL\n"));
+
+        client.cancel().await.unwrap();
+        shutdown.shutdown().await;
+        server_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_read_reports_evicted_history_and_returns_retained_suffix() {
+        let mut config = test_config();
+        config.max_output = 16 * 1024;
+        config.max_response_output = 8 * 1024;
+        config.max_task_result_output = 8 * 1024;
+        let server = ShellVibe::new(config);
+        let shutdown = server.clone();
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = ClientInfo::new(
+            ClientCapabilities::default(),
+            Implementation::new("shellvibe-test", "0"),
+        )
+        .serve(client_transport)
+        .await
+        .unwrap();
+
+        let completed = complete_value(
+            client
+                .call_tool_once(
+                    CallToolRequestParams::new("shell").with_arguments(arguments(json!({
+                        "command": "yes eviction-data | head -c 131072; printf 'EVICTED-END'",
+                        "yieldMs": 5000
+                    }))),
+                )
+                .await
+                .unwrap(),
+        );
+        let process_id = completed["processId"].as_str().unwrap();
+        let retained = complete_value(
+            client
+                .call_tool_once(
+                    CallToolRequestParams::new("shell_read").with_arguments(arguments(json!({
+                        "processId": process_id,
+                        "cursor": 0
+                    }))),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(retained["cursorLost"], true);
+        assert!(!retained["events"].as_array().unwrap().is_empty());
+        assert!(retained["nextCursor"].as_u64().unwrap() > 0);
+
+        client.cancel().await.unwrap();
+        shutdown.shutdown().await;
+        server_task.abort();
     }
 }
