@@ -195,6 +195,10 @@ impl OutputBuffer {
     fn newest_cursor(&self) -> u64 {
         self.next_cursor.saturating_sub(1)
     }
+
+    fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
 }
 
 #[derive(Default)]
@@ -314,6 +318,7 @@ pub struct ManagedProcess {
     input: Mutex<ProcessInput>,
     control: ProcessControl,
     pty_size: StdMutex<(u16, u16)>,
+    pty_write_slot: Arc<Semaphore>,
     max_response_output: usize,
     notify: Notify,
     running_slot: StdMutex<Option<OwnedSemaphorePermit>>,
@@ -349,6 +354,7 @@ impl ManagedProcess {
             input: Mutex::new(input),
             control,
             pty_size: StdMutex::new((rows, cols)),
+            pty_write_slot: Arc::new(Semaphore::new(1)),
             max_response_output,
             notify: Notify::new(),
             running_slot: StdMutex::new(Some(running_slot)),
@@ -389,14 +395,25 @@ impl ManagedProcess {
         self.notify.notify_waiters();
     }
 
-    fn set_termination_intent(&self, status: ProcessStatus, marker: impl Into<String>) {
+    fn set_termination_intent(&self, status: ProcessStatus, marker: impl Into<String>) -> bool {
         let mut state = self.state.lock().expect("state mutex poisoned");
-        if state.status == ProcessStatus::Running && state.termination_intent.is_none() {
+        if state.status != ProcessStatus::Running || state.root_exited {
+            return false;
+        }
+        if state.termination_intent.is_none() {
             state.termination_intent = Some(TerminationIntent {
                 status,
                 marker: marker.into(),
             });
         }
+        true
+    }
+
+    fn mark_output_truncated(&self) {
+        self.output
+            .lock()
+            .expect("output mutex poisoned")
+            .mark_truncated();
     }
 
     fn finish(
@@ -454,9 +471,14 @@ impl ManagedProcess {
                     .context("failed to flush process stdin")?;
             }
             ProcessInput::Pty(writer) => {
+                let write_slot = Arc::clone(&self.pty_write_slot)
+                    .acquire_owned()
+                    .await
+                    .expect("PTY write semaphore is never closed");
                 let writer = Arc::clone(writer);
                 let bytes = data.to_vec();
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let _write_slot = write_slot;
                     let mut writer = writer
                         .lock()
                         .map_err(|_| anyhow::anyhow!("PTY writer mutex poisoned"))?;
@@ -556,7 +578,10 @@ impl ManagedProcess {
             }
             return Ok(());
         }
-        self.set_termination_intent(status, marker.to_string());
+        if !self.set_termination_intent(status, marker.to_string()) {
+            self.wait_until_terminal().await;
+            return Ok(());
+        }
 
         let term_error = signal_tree(&self.control, SignalKind::Term).await.err();
         if tokio::time::timeout(grace, self.wait_until_terminal())
@@ -927,6 +952,13 @@ impl ProcessManager {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn running_count_for_test(&self) -> usize {
+        self.config
+            .max_processes
+            .saturating_sub(self.process_slots.available_permits())
+    }
+
     fn prune(&self) {
         let retention = self.config.process_retention;
         self.processes.retain(|_, process| {
@@ -1002,7 +1034,9 @@ impl ProcessManager {
                 wait_process.mark_root_exited();
             }
             cleanup_descendants(&wait_process.control).await;
-            drain_pair(stdout_task, stderr_task, Duration::from_millis(250)).await;
+            if !drain_pair(stdout_task, stderr_task, Duration::from_millis(250)).await {
+                wait_process.mark_output_truncated();
+            }
             match waited {
                 Ok(status) => {
                     #[cfg(unix)]
@@ -1140,14 +1174,16 @@ impl ProcessManager {
 
         let wait_process = Arc::clone(&process);
         tokio::spawn(async move {
-            let waited = tokio::task::spawn_blocking(move || child.wait()).await;
-            if matches!(&waited, Ok(Ok(_))) {
+            let waited = wait_portable_child(&mut child).await;
+            if waited.is_ok() {
                 wait_process.mark_root_exited();
             }
             cleanup_descendants(&wait_process.control).await;
-            drain_one(output_task, Duration::from_millis(250)).await;
+            if !drain_one(output_task, Duration::from_millis(250)).await {
+                wait_process.mark_output_truncated();
+            }
             match waited {
-                Ok(Ok(status)) => {
+                Ok(status) => {
                     let signal = status.signal().map(normalize_portable_signal);
                     let final_status = if signal.is_some() {
                         ProcessStatus::Signaled
@@ -1157,17 +1193,10 @@ impl ProcessManager {
                     let exit_code = signal.is_none().then_some(status.exit_code() as i32);
                     wait_process.finish(final_status, exit_code, signal);
                 }
-                Ok(Err(error)) => {
-                    wait_process.append_output(
-                        OutputStream::Pty,
-                        &format!("\r\nshellvibe wait error: {error}\r\n"),
-                    );
-                    wait_process.finish(ProcessStatus::Failed, None, None);
-                }
                 Err(error) => {
                     wait_process.append_output(
                         OutputStream::Pty,
-                        &format!("\r\nshellvibe PTY wait task failed: {error}\r\n"),
+                        &format!("\r\nshellvibe wait error: {error}\r\n"),
                     );
                     wait_process.finish(ProcessStatus::Failed, None, None);
                 }
@@ -1188,7 +1217,22 @@ async fn kill_portable_child(
     .await;
 }
 
-async fn drain_pair(mut first: JoinHandle<()>, mut second: JoinHandle<()>, grace: Duration) {
+async fn wait_portable_child(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+) -> std::io::Result<portable_pty::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn drain_pair(
+    mut first: JoinHandle<()>,
+    mut second: JoinHandle<()>,
+    grace: Duration,
+) -> bool {
     let completed = tokio::time::timeout(grace, async {
         let _ = (&mut first).await;
         let _ = (&mut second).await;
@@ -1199,12 +1243,15 @@ async fn drain_pair(mut first: JoinHandle<()>, mut second: JoinHandle<()>, grace
         first.abort();
         second.abort();
     }
+    completed
 }
 
-async fn drain_one(mut task: JoinHandle<()>, grace: Duration) {
-    if tokio::time::timeout(grace, &mut task).await.is_err() {
+async fn drain_one(mut task: JoinHandle<()>, grace: Duration) -> bool {
+    let completed = tokio::time::timeout(grace, &mut task).await.is_ok();
+    if !completed {
         task.abort();
     }
+    completed
 }
 
 #[cfg(unix)]
@@ -1476,6 +1523,42 @@ fn truncate_chars(input: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ExecutionMode;
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    fn test_managed_process() -> Arc<ManagedProcess> {
+        let running_slot = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let handle_slot = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        ManagedProcess::new(
+            CommandSpec {
+                mode: CommandMode::Shell {
+                    shell: PathBuf::from("sh"),
+                    command: "true".to_string(),
+                },
+                execution: ExecutionMode::Foreground,
+                cwd: PathBuf::from("."),
+                env: BTreeMap::new(),
+                initial_stdin: None,
+                pty: false,
+                rows: 24,
+                cols: 80,
+                timeout: Duration::from_secs(1),
+            },
+            None,
+            ProcessInput::Closed,
+            ProcessControl {
+                pid: None,
+                pty_killer: None,
+                pty_master: None,
+                #[cfg(unix)]
+                process_group: None,
+            },
+            64,
+            64,
+            running_slot,
+            handle_slot,
+        )
+    }
 
     #[test]
     fn output_buffer_is_bounded_and_paginated() {
@@ -1519,6 +1602,27 @@ mod tests {
         assert_eq!(tail, "final-line\n");
         assert!(truncated);
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn explicit_output_loss_marks_the_tail_truncated() {
+        let mut buffer = OutputBuffer::new(64, 16, Instant::now());
+        buffer.append(OutputStream::Stdout, "complete retained output");
+        buffer.mark_truncated();
+        let (_, truncated, _) = buffer.tail(64);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn termination_intent_cannot_override_an_observed_root_exit() {
+        let process = test_managed_process();
+        process.mark_root_exited();
+        assert!(!process.set_termination_intent(ProcessStatus::TimedOut, "TIMEOUT"));
+        process.finish(ProcessStatus::Exited, Some(0), None);
+        let result = process.completion_result(64);
+        assert_eq!(result.status, ProcessStatus::Exited);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.signal, None);
     }
 
     #[test]

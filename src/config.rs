@@ -61,13 +61,13 @@ pub struct Cli {
     #[arg(long = "max-output", default_value = "4MiB", value_parser = parse_bytes)]
     pub max_output: usize,
 
-    /// Maximum event-data budget for shell_read pages and other output-bearing results.
+    /// Maximum event-data budget for each shell_read page.
     #[arg(long = "max-response-output", default_value = "32KiB", value_parser = parse_bytes)]
     pub max_response_output: usize,
 
-    /// Maximum event-data budget persisted in a completed MCP Task result.
-    #[arg(long = "max-task-result-output", default_value = "16KiB", value_parser = parse_bytes)]
-    pub max_task_result_output: usize,
+    /// Maximum output-tail budget in foreground and completed MCP Task results.
+    #[arg(long = "max-completion-output", default_value = "16KiB", value_parser = parse_bytes)]
+    pub max_completion_output: usize,
 
     /// Maximum number of simultaneously managed OS processes.
     #[arg(long = "max-processes", default_value_t = 16)]
@@ -115,7 +115,7 @@ pub struct Config {
     pub max_runtime: Duration,
     pub max_output: usize,
     pub max_response_output: usize,
-    pub max_task_result_output: usize,
+    pub max_completion_output: usize,
     pub max_processes: usize,
     pub max_process_handles: usize,
     pub max_tool_calls_per_minute: usize,
@@ -182,11 +182,11 @@ impl TryFrom<Cli> for Config {
         if cli.max_response_output > cli.max_output {
             bail!("--max-response-output cannot exceed --max-output");
         }
-        if cli.max_task_result_output < 8192 {
-            bail!("--max-task-result-output must be at least 8KiB");
+        if cli.max_completion_output < 8192 {
+            bail!("--max-completion-output must be at least 8KiB");
         }
-        if cli.max_task_result_output > cli.max_response_output {
-            bail!("--max-task-result-output cannot exceed --max-response-output");
+        if cli.max_completion_output > cli.max_response_output {
+            bail!("--max-completion-output cannot exceed --max-response-output");
         }
         if cli.max_runtime.is_zero() {
             bail!("--max-runtime must be greater than zero");
@@ -224,7 +224,7 @@ impl TryFrom<Cli> for Config {
             max_runtime: cli.max_runtime,
             max_output: cli.max_output,
             max_response_output: cli.max_response_output,
-            max_task_result_output: cli.max_task_result_output,
+            max_completion_output: cli.max_completion_output,
             max_processes: cli.max_processes,
             max_process_handles: cli.max_process_handles,
             max_tool_calls_per_minute: cli.max_tool_calls_per_minute,
@@ -403,5 +403,21 @@ mod tests {
     fn configuration_requires_an_explicit_execution_policy() {
         let cli = Cli::try_parse_from(["shellvibe"]).unwrap();
         assert!(Config::try_from(cli).is_err());
+    }
+
+    #[test]
+    fn completion_output_limit_is_configurable() {
+        let cli = Cli::try_parse_from([
+            "shellvibe",
+            "--unrestricted",
+            "--max-response-output",
+            "24KiB",
+            "--max-completion-output",
+            "12KiB",
+        ])
+        .unwrap();
+        let config = Config::try_from(cli).unwrap();
+        assert_eq!(config.max_response_output, 24 * 1024);
+        assert_eq!(config.max_completion_output, 12 * 1024);
     }
 }

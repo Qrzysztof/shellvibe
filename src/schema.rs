@@ -41,8 +41,8 @@ fn shell_tool(policy: &ExecPolicy) -> Tool {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": MAX_ARGV_ITEMS,
-                    "items": {"type": "string", "maxLength": MAX_ARG_BYTES},
-                    "description": "Executable and arguments. argv[0] is resolved and checked against the startup policy."
+                    "items": {"type": "string", "minLength": 1, "maxLength": MAX_ARG_BYTES},
+                    "description": "Executable and arguments. argv[0] is resolved and checked against the startup policy. Runtime size limits are authoritative and count UTF-8 bytes, while JSON Schema maxLength counts characters."
                 }
             }),
         )
@@ -54,7 +54,7 @@ fn shell_tool(policy: &ExecPolicy) -> Tool {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_COMMAND_BYTES,
-                    "description": "Command passed to the configured shell using -c (or cmd.exe /C on Windows)."
+                    "description": "Non-whitespace command passed to the configured shell using -c (or cmd.exe /C on Windows). Runtime size limits are authoritative and count UTF-8 bytes, while JSON Schema maxLength counts characters."
                 }
             }),
         )
@@ -93,15 +93,15 @@ fn shell_tool(policy: &ExecPolicy) -> Tool {
 
 fn common_shell_properties() -> JsonObject {
     serde_json::from_value(json!({
-        "cwd": {"type": "string", "maxLength": MAX_PATH_BYTES, "description": "Working directory for this process."},
+        "cwd": {"type": "string", "maxLength": MAX_PATH_BYTES, "description": "Working directory for this process. The runtime limit counts UTF-8 bytes; JSON Schema maxLength counts characters."},
         "env": {
             "type": "object",
             "maxProperties": MAX_ENV_ITEMS,
-            "propertyNames": {"minLength": 1, "pattern": "^[^=]+$"},
+            "propertyNames": {"minLength": 1, "pattern": "^[^=\\u0000]+$"},
             "additionalProperties": {"type": "string", "maxLength": MAX_STDIN_BYTES},
-            "description": "Environment variables added or overridden for the child process. Top-level executable policy resolution uses shellvibe's own startup PATH."
+            "description": "Environment variables added or overridden for the child process. Runtime aggregate size limits count UTF-8 bytes; JSON Schema maxLength counts characters. Top-level executable policy resolution uses shellvibe's own startup PATH."
         },
-        "stdin": {"type": "string", "maxLength": MAX_STDIN_BYTES, "description": "Optional UTF-8 input written immediately after spawn."},
+        "stdin": {"type": "string", "maxLength": MAX_STDIN_BYTES, "description": "Optional UTF-8 input written immediately after spawn. The runtime limit counts UTF-8 bytes; JSON Schema maxLength counts characters."},
         "execution": {
             "type": "string",
             "enum": ["foreground", "background", "interactive"],
@@ -140,7 +140,7 @@ fn read_tool() -> Tool {
             .read_only(true)
             .destructive(false)
             .idempotent(true)
-            .open_world(false),
+            .open_world(true),
     )
 }
 
@@ -155,7 +155,7 @@ fn write_tool() -> Tool {
             "required": ["processId"],
             "properties": {
                 "processId": {"type": "string", "pattern": "^p_[0-9a-f]{32}$"},
-                "data": {"type": "string", "maxLength": MAX_STDIN_BYTES},
+                "data": {"type": "string", "maxLength": MAX_STDIN_BYTES, "description": "Runtime size validation counts UTF-8 bytes, including an appended newline; JSON Schema maxLength counts characters."},
                 "appendNewline": {"type": "boolean", "default": false},
                 "closeStdin": {"type": "boolean", "default": false, "description": "Drop the stdin/PTY writer after any data is written, delivering EOF where supported."}
             },
@@ -172,7 +172,7 @@ fn write_tool() -> Tool {
             .read_only(false)
             .destructive(true)
             .idempotent(false)
-            .open_world(false),
+            .open_world(true),
     )
 }
 
@@ -198,7 +198,7 @@ fn signal_tool() -> Tool {
             .read_only(false)
             .destructive(true)
             .idempotent(false)
-            .open_world(false),
+            .open_world(true),
     )
 }
 
@@ -225,7 +225,7 @@ fn resize_tool() -> Tool {
             .read_only(false)
             .destructive(false)
             .idempotent(true)
-            .open_world(false),
+            .open_world(true),
     )
 }
 
@@ -262,9 +262,9 @@ fn shell_result_schema() -> Value {
             "exitCode": {"type": "integer"},
             "signal": {"type": "string"},
             "elapsedMs": {"type": "integer", "minimum": 0, "description": "Total process lifetime in milliseconds, not tool-call or read latency."},
-            "output": {"type": "string", "description": "Bounded ordered output tail present for completed foreground execution."},
-            "outputTruncated": {"type": "boolean", "description": "Whether foreground output was truncated. When true, retained output can be retrieved with shell_read(cursor=0) while the process handle remains available."},
-            "nextCursor": {"type": "integer", "minimum": 0, "description": "Latest output-event cursor, not a byte or line offset."}
+            "output": {"type": "string", "description": "Bounded ordered output tail present for direct foreground completions and completed MCP Task results."},
+            "outputTruncated": {"type": "boolean", "description": "Whether completion output was truncated. When true, retained output can be retrieved with shell_read(cursor=0) while the process handle remains available."},
+            "nextCursor": {"type": "integer", "minimum": 0, "description": "Output-event cursor following output represented by this result, not a byte or line offset. Handle-only running results use 0 because they contain no output; read from cursor 0 to retrieve retained output."}
         }
     })
 }
@@ -383,6 +383,13 @@ mod tests {
             .unwrap();
         assert!(properties.contains_key("argv"));
         assert!(!properties.contains_key("command"));
+        assert_eq!(properties["argv"]["items"]["minLength"], json!(1));
+        assert!(
+            properties["argv"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("UTF-8 bytes")
+        );
     }
 
     #[test]
@@ -418,6 +425,33 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("evicted")
+        );
+    }
+
+    #[test]
+    fn process_tools_are_annotated_as_open_world() {
+        for tool in [read_tool(), write_tool(), signal_tool(), resize_tool()] {
+            assert_eq!(tool.annotations.unwrap().open_world_hint, Some(true));
+        }
+    }
+
+    #[test]
+    fn schema_describes_runtime_byte_validation_without_custom_keywords() {
+        let tool = shell_tool(&ExecPolicy::Unrestricted);
+        let command = &tool.input_schema["properties"]["command"];
+        assert_eq!(command["maxLength"], json!(MAX_COMMAND_BYTES));
+        assert!(
+            command["description"]
+                .as_str()
+                .unwrap()
+                .contains("UTF-8 bytes")
+        );
+        assert!(command.get("maxByteLength").is_none());
+
+        let common = common_shell_properties();
+        assert_eq!(
+            common["env"]["propertyNames"]["pattern"],
+            json!("^[^=\\u0000]+$")
         );
     }
 }

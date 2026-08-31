@@ -23,7 +23,6 @@ use tracing::debug;
 
 const MAX_TOOL_ERROR_CHARS: usize = 2_048;
 const MAX_TOOL_NAME_CHARS: usize = 128;
-const MAX_COMPLETION_OUTPUT_BYTES: usize = 8 * 1024;
 
 use crate::{
     config::{Config, duration_ms},
@@ -373,7 +372,7 @@ impl ShellVibe {
         let ttl_ms = duration_ms(self.config.task_ttl).max(1);
         let status_interval = self.config.progress_interval;
         let termination_grace = self.config.termination_grace;
-        let max_task_result_output = self.config.max_task_result_output;
+        let max_completion_output = self.config.max_completion_output;
 
         let task = self.tasks.spawn(
             TaskOptions::new()
@@ -386,7 +385,7 @@ impl ShellVibe {
                     task_context,
                     status_interval,
                     termination_grace,
-                    max_task_result_output,
+                    max_completion_output,
                 ))
             },
         );
@@ -395,9 +394,7 @@ impl ShellVibe {
     }
 
     fn completion_output_budget(&self) -> usize {
-        self.config
-            .max_task_result_output
-            .min(MAX_COMPLETION_OUTPUT_BYTES)
+        self.config.max_completion_output
     }
 
     async fn call_read(&self, request: ReadRequest) -> CallToolResult {
@@ -528,7 +525,7 @@ async fn run_process_task(
     task_context: TaskContext,
     status_interval: Duration,
     termination_grace: Duration,
-    max_task_result_output: usize,
+    max_completion_output: usize,
 ) -> Result<CallToolResult, TaskExit> {
     let mut guard = TaskProcessGuard::new(Arc::clone(&process), termination_grace);
     let mut interval = tokio::time::interval(status_interval);
@@ -538,9 +535,9 @@ async fn run_process_task(
     loop {
         if !process.is_running() {
             guard.disarm();
-            return Ok(result_for_shell(process.completion_result(
-                max_task_result_output.min(MAX_COMPLETION_OUTPUT_BYTES),
-            )));
+            return Ok(result_for_shell(
+                process.completion_result(max_completion_output),
+            ));
         }
 
         tokio::select! {
@@ -554,8 +551,7 @@ async fn run_process_task(
                         None,
                     )));
                 }
-                let snapshot = process
-                    .completion_result(max_task_result_output.min(MAX_COMPLETION_OUTPUT_BYTES));
+                let snapshot = process.completion_result(max_completion_output);
                 if snapshot.status == ProcessStatus::Cancelled {
                     return Err(TaskExit::Cancelled);
                 }
@@ -567,9 +563,9 @@ async fn run_process_task(
             }
             _ = process.wait_for_notification() => {
                 if !process.is_running() {
-                    return Ok(result_for_shell(process.completion_result(
-                        max_task_result_output.min(MAX_COMPLETION_OUTPUT_BYTES),
-                    )));
+                    return Ok(result_for_shell(
+                        process.completion_result(max_completion_output),
+                    ));
                 }
             }
             _ = interval.tick() => {
@@ -821,7 +817,7 @@ mod tests {
             max_runtime: Duration::from_secs(10),
             max_output: 2 * 1024 * 1024,
             max_response_output: 32 * 1024,
-            max_task_result_output: 16 * 1024,
+            max_completion_output: 12 * 1024,
             max_processes: 8,
             max_process_handles: 16,
             max_tool_calls_per_minute: 100,
@@ -861,6 +857,42 @@ mod tests {
         assert!(limiter.check().is_ok());
         assert!(limiter.check().is_ok());
         assert!(limiter.check().is_err());
+    }
+
+    #[test]
+    fn command_limit_is_enforced_in_utf8_bytes() {
+        let exact = ShellRequest {
+            command: Some("é".repeat(MAX_COMMAND_BYTES / 2)),
+            argv: None,
+            cwd: None,
+            env: Default::default(),
+            stdin: None,
+            execution: ExecutionMode::Foreground,
+            pty: false,
+            yield_ms: None,
+            timeout_ms: None,
+            rows: None,
+            cols: None,
+        };
+        assert_eq!(
+            exact.command.as_ref().unwrap().chars().count(),
+            MAX_COMMAND_BYTES / 2
+        );
+        assert_eq!(exact.command.as_ref().unwrap().len(), MAX_COMMAND_BYTES);
+        assert!(validate_shell_request(&exact).is_ok());
+
+        let over = ShellRequest {
+            command: Some("界".repeat(MAX_COMMAND_BYTES / 3 + 1)),
+            ..exact
+        };
+        assert!(over.command.as_ref().unwrap().chars().count() < MAX_COMMAND_BYTES);
+        assert!(over.command.as_ref().unwrap().len() > MAX_COMMAND_BYTES);
+        assert!(
+            validate_shell_request(&over)
+                .unwrap_err()
+                .to_string()
+                .contains("bytes")
+        );
     }
 
     #[cfg(unix)]
@@ -1083,7 +1115,7 @@ mod tests {
         let long = client
             .call_tool_once(
                 CallToolRequestParams::new("shell").with_arguments(arguments(json!({
-                    "command": "sleep 0.15; printf task-final",
+                    "command": "yes 0123456789 | head -c 65536; sleep 0.15; printf task-final",
                     "yieldMs": 20
                 }))),
             )
@@ -1111,7 +1143,11 @@ mod tests {
         };
         let result: CallToolResult = serde_json::from_value(Value::Object(result)).unwrap();
         let structured = result.structured_content.unwrap();
-        assert_eq!(structured["output"], "task-final");
+        let output = structured["output"].as_str().unwrap();
+        assert!(output.len() > 8 * 1024);
+        assert!(output.len() <= 12 * 1024);
+        assert!(output.ends_with("task-final"));
+        assert_eq!(structured["outputTruncated"], true);
 
         let cancellable = client
             .call_tool_once(
@@ -1143,6 +1179,13 @@ mod tests {
                 break;
             }
         }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while shutdown.manager.running_count_for_test() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("task cancellation left its OS process running");
 
         client.cancel().await.unwrap();
         shutdown.shutdown().await;
@@ -1394,10 +1437,11 @@ mod tests {
                 .unwrap(),
         );
         let output = result["output"].as_str().unwrap();
-        assert!(output.len() <= MAX_COMPLETION_OUTPUT_BYTES);
+        assert!(output.len() > 8 * 1024);
+        assert!(output.len() <= 12 * 1024);
         assert!(output.ends_with("FINAL\n"));
         assert_eq!(result["outputTruncated"], true);
-        assert!(serde_json::to_vec(&result).unwrap().len() < 9 * 1024);
+        assert!(serde_json::to_vec(&result).unwrap().len() < 15 * 1024);
         let process_id = result["processId"].as_str().unwrap();
         let mut cursor = 0_u64;
         let mut previous_event_cursor = 0_u64;
@@ -1459,7 +1503,7 @@ mod tests {
         let mut config = test_config();
         config.max_output = 16 * 1024;
         config.max_response_output = 8 * 1024;
-        config.max_task_result_output = 8 * 1024;
+        config.max_completion_output = 8 * 1024;
         let server = ShellVibe::new(config);
         let shutdown = server.clone();
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
