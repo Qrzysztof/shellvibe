@@ -41,6 +41,7 @@ struct ProcessState {
     signal: Option<String>,
     finished_at: Option<Instant>,
     termination_intent: Option<TerminationIntent>,
+    signal_hint: Option<String>,
 }
 
 impl Default for ProcessState {
@@ -52,6 +53,7 @@ impl Default for ProcessState {
             signal: None,
             finished_at: None,
             termination_intent: None,
+            signal_hint: None,
         }
     }
 }
@@ -408,11 +410,24 @@ impl ManagedProcess {
             return;
         }
         let intent = state.termination_intent.take();
-        state.status = intent
+        let final_status = intent
             .as_ref()
             .map_or(natural_status, |intent| intent.status);
-        state.exit_code = exit_code;
-        state.signal = intent.map(|intent| intent.marker).or(signal);
+        let signal_hint = state.signal_hint.take();
+        state.status = final_status;
+        state.exit_code = (final_status == ProcessStatus::Exited)
+            .then_some(exit_code)
+            .flatten();
+        state.signal = intent.map(|intent| intent.marker).or_else(|| {
+            if final_status != ProcessStatus::Signaled {
+                return None;
+            }
+            if signal.as_deref() == Some("SIGUNKNOWN") {
+                signal_hint.or(signal)
+            } else {
+                signal.or(signal_hint)
+            }
+        });
         state.finished_at = Some(Instant::now());
         drop(state);
         self.running_slot
@@ -495,7 +510,21 @@ impl ManagedProcess {
     pub async fn signal(&self, signal: SignalKind) -> anyhow::Result<()> {
         debug!(process_id = %self.id, signal = signal.as_str(), "signaling process");
         if self.is_running() {
-            signal_tree(&self.control, signal).await?;
+            let hint = format!("SIG{}", signal.as_str());
+            let previous_hint = {
+                let mut state = self.state.lock().expect("state mutex poisoned");
+                if state.status != ProcessStatus::Running {
+                    return Ok(());
+                }
+                state.signal_hint.replace(hint.clone())
+            };
+            if let Err(error) = signal_tree(&self.control, signal).await {
+                let mut state = self.state.lock().expect("state mutex poisoned");
+                if state.signal_hint.as_deref() == Some(&hint) {
+                    state.signal_hint = previous_hint;
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -966,7 +995,7 @@ impl ProcessManager {
                     #[cfg(unix)]
                     let signal = {
                         use std::os::unix::process::ExitStatusExt;
-                        status.signal().map(|value| format!("SIG{value}"))
+                        status.signal().map(native_signal_name)
                     };
                     #[cfg(not(unix))]
                     let signal: Option<String> = None;
@@ -1106,13 +1135,14 @@ impl ProcessManager {
             drain_one(output_task, Duration::from_millis(250)).await;
             match waited {
                 Ok(Ok(status)) => {
-                    let signal = status.signal().map(ToOwned::to_owned);
+                    let signal = status.signal().map(normalize_portable_signal);
                     let final_status = if signal.is_some() {
                         ProcessStatus::Signaled
                     } else {
                         ProcessStatus::Exited
                     };
-                    wait_process.finish(final_status, Some(status.exit_code() as i32), signal);
+                    let exit_code = signal.is_none().then_some(status.exit_code() as i32);
+                    wait_process.finish(final_status, exit_code, signal);
                 }
                 Ok(Err(error)) => {
                     wait_process.append_output(
@@ -1370,6 +1400,26 @@ async fn signal_tree(control: &ProcessControl, signal: SignalKind) -> anyhow::Re
     bail!("taskkill failed to signal the process tree");
     #[cfg(not(any(unix, windows)))]
     bail!("process signalling is not supported on this platform");
+}
+
+#[cfg(unix)]
+fn native_signal_name(value: i32) -> String {
+    nix::sys::signal::Signal::try_from(value).map_or_else(
+        |_| format!("SIG{value}"),
+        |signal| signal.as_str().to_string(),
+    )
+}
+
+fn normalize_portable_signal(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with("SIG")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return value.to_string();
+    }
+    "SIGUNKNOWN".to_string()
 }
 
 fn status_message(status: ProcessStatus, exit_code: Option<i32>, elapsed: Duration) -> String {

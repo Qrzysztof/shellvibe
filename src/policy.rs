@@ -18,6 +18,11 @@ pub enum ExecPolicy {
     },
 }
 
+struct ResolvedExecutable {
+    invocation: PathBuf,
+    canonical: PathBuf,
+}
+
 impl ExecPolicy {
     pub fn allow(items: Vec<String>, cwd: &Path) -> anyhow::Result<Self> {
         if items.is_empty() {
@@ -25,7 +30,7 @@ impl ExecPolicy {
         }
         let mut paths = BTreeSet::new();
         for item in items {
-            paths.insert(resolve_executable(item.trim(), cwd)?);
+            paths.insert(resolve_executable(item.trim(), cwd)?.canonical);
         }
         Ok(Self::Allow(paths))
     }
@@ -44,8 +49,8 @@ impl ExecPolicy {
             if let Some(name) = executable_identity(Path::new(item)) {
                 names.insert(name);
             }
-            if let Ok(path) = resolve_executable(item, cwd) {
-                paths.insert(path);
+            if let Ok(resolved) = resolve_executable(item, cwd) {
+                paths.insert(resolved.canonical);
             }
         }
         Ok(Self::Deny { names, paths })
@@ -71,16 +76,16 @@ impl ExecPolicy {
         }
         let resolved = resolve_executable(requested, cwd)?;
         match self {
-            Self::Allow(allowed) if !allowed.contains(&resolved) => {
+            Self::Allow(allowed) if !allowed.contains(&resolved.canonical) => {
                 bail!(
                     "executable '{}' is not in the --allow-exec list",
-                    resolved.display()
+                    resolved.canonical.display()
                 )
             }
             Self::Deny { names, paths } => {
                 let requested_name = executable_identity(Path::new(requested));
-                let resolved_name = executable_identity(&resolved);
-                if paths.contains(&resolved)
+                let resolved_name = executable_identity(&resolved.canonical);
+                if paths.contains(&resolved.canonical)
                     || requested_name
                         .as_ref()
                         .is_some_and(|name| names.contains(name))
@@ -90,17 +95,17 @@ impl ExecPolicy {
                 {
                     bail!(
                         "executable '{}' is denied by --deny-exec",
-                        resolved.display()
+                        resolved.canonical.display()
                     );
                 }
-                Ok(resolved)
+                Ok(resolved.invocation)
             }
-            _ => Ok(resolved),
+            _ => Ok(resolved.invocation),
         }
     }
 }
 
-fn resolve_executable(requested: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
+fn resolve_executable(requested: &str, cwd: &Path) -> anyhow::Result<ResolvedExecutable> {
     if requested.is_empty() {
         bail!("argv[0] must not be empty");
     }
@@ -111,29 +116,40 @@ fn resolve_executable(requested: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
         } else {
             cwd.join(requested_path)
         };
-        return canonical_executable(path, requested);
+        return resolved_executable(path, requested);
     }
 
     let path_env = env::var_os("PATH").unwrap_or_default();
     for dir in env::split_paths(&path_env) {
         for candidate in candidates(&dir, requested) {
             if is_executable_file(&candidate) {
-                return canonical_executable(candidate, requested);
+                return resolved_executable(candidate, requested);
             }
         }
     }
     bail!("executable '{requested}' was not found in shellvibe's PATH")
 }
 
-fn canonical_executable(path: PathBuf, requested: &str) -> anyhow::Result<PathBuf> {
+fn resolved_executable(path: PathBuf, requested: &str) -> anyhow::Result<ResolvedExecutable> {
     if !is_executable_file(&path) {
         bail!(
             "executable '{requested}' does not resolve to an executable file: {}",
             path.display()
         );
     }
-    std::fs::canonicalize(&path)
-        .with_context(|| format!("failed to canonicalize executable {}", path.display()))
+    let invocation = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .context("cannot determine current directory while resolving executable")?
+            .join(path)
+    };
+    let canonical = std::fs::canonicalize(&invocation)
+        .with_context(|| format!("failed to canonicalize executable {}", invocation.display()))?;
+    Ok(ResolvedExecutable {
+        invocation,
+        canonical,
+    })
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -221,5 +237,36 @@ mod tests {
             executable_identity(Path::new("/usr/bin/git")).as_deref(),
             Some("git")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allow_policy_revalidates_the_canonical_symlink_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = std::env::temp_dir().join(format!("shellvibe-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let allowed = root.join("allowed");
+        let denied = root.join("denied");
+        let proxy = root.join("proxy");
+        for path in [&allowed, &denied] {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        symlink(&allowed, &proxy).unwrap();
+
+        let policy = ExecPolicy::allow(vec![proxy.to_string_lossy().into_owned()], &root).unwrap();
+        assert_eq!(
+            policy.authorize(proxy.to_str().unwrap(), &root).unwrap(),
+            proxy
+        );
+
+        std::fs::remove_file(&proxy).unwrap();
+        symlink(&denied, &proxy).unwrap();
+        assert!(policy.authorize(proxy.to_str().unwrap(), &root).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -860,6 +860,62 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn restricted_rustup_proxies_preserve_the_requested_executable_identity() {
+        let mut config = test_config();
+        config.policy = ExecPolicy::allow(
+            vec!["cargo".to_string(), "rustc".to_string()],
+            &config.workdir,
+        )
+        .unwrap();
+        let server = ShellVibe::new(config);
+        let shutdown = server.clone();
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = ClientInfo::new(
+            ClientCapabilities::default(),
+            Implementation::new("shellvibe-test", "0"),
+        )
+        .serve(client_transport)
+        .await
+        .unwrap();
+
+        for executable in ["cargo", "rustc"] {
+            let result = complete_value(
+                client
+                    .call_tool_once(
+                        CallToolRequestParams::new("shell").with_arguments(arguments(json!({
+                            "argv": [executable, "--version"],
+                            "yieldMs": 5000
+                        }))),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(result["status"], "exited");
+            assert_eq!(result["exitCode"], 0);
+            let output = result["output"].as_str().unwrap();
+            let expected_prefix = format!("{executable} ");
+            assert!(
+                output.starts_with(&expected_prefix),
+                "{executable} proxy produced unexpected output: {output:?}"
+            );
+        }
+
+        client.cancel().await.unwrap();
+        shutdown.shutdown().await;
+        server_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn tasks_are_negotiated_on_the_real_tool_call() {
         let server = ShellVibe::new(test_config());
         let shutdown = server.clone();
@@ -1140,6 +1196,29 @@ mod tests {
         );
         assert_eq!(signal["accepted"], true);
         assert!(signal.get("events").is_none());
+
+        let mut cursor = 0;
+        let terminal = loop {
+            let read = complete_value(
+                client
+                    .call_tool_once(CallToolRequestParams::new("shell_read").with_arguments(
+                        arguments(json!({
+                            "processId": process_id,
+                            "cursor": cursor,
+                            "waitMs": 500
+                        })),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            if read["status"] != "running" {
+                break read;
+            }
+            cursor = read["nextCursor"].as_u64().unwrap();
+        };
+        assert_eq!(terminal["status"], "signaled");
+        assert_eq!(terminal["signal"], "SIGTERM");
+        assert!(terminal.get("exitCode").is_none());
 
         client.cancel().await.unwrap();
         shutdown.shutdown().await;
